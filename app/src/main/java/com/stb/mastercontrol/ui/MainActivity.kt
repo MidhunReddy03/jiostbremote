@@ -682,7 +682,7 @@ fun PowerUserDashboardTab(
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     LinearProgressIndicator(
-                        progress = { state.sideloadProgress },
+                        progress = { state.sideloadProgress ?: 0f },
                         color = NeuColors.OceanicBlue,
                         trackColor = NeuColors.Background,
                         modifier = Modifier

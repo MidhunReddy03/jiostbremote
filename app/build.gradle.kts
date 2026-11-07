@@ -29,6 +29,15 @@ android {
         }
     }
 
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "/META-INF/DEPENDENCIES"
+            excludes += "/META-INF/LICENSE*"
+            excludes += "/META-INF/NOTICE*"
+        }
+    }
+
     buildFeatures {
         compose = true
     }
@@ -45,7 +54,11 @@ android {
 }
 
 dependencies {
-    implementation("dev.mobile:dadb:1.2.9")
+    implementation("dev.mobile:dadb:1.2.9") {
+        // dadb's POM leaks its GraalVM/JUnit test helper into the runtime classpath.
+        // It is not needed on Android and would otherwise end up in the APK / R8 graph.
+        exclude(group = "org.graalvm.buildtools", module = "junit-platform-native")
+    }
 
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)

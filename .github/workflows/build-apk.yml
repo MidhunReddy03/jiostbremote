@@ -19,15 +19,17 @@ jobs:
           distribution: 'temurin'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.7'
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Build Optimized Release APK
-        run: gradle assembleRelease
+      - name: Build Release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Upload Ready-to-Install APK
         uses: actions/upload-artifact@v4
         with:
           name: STB-Master-Control-APK
           path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
