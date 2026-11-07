@@ -17,9 +17,9 @@ android {
 
     buildTypes {
         release {
-            // Shrinks & optimizes code for maximum speed and tiny RAM footprint
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // Disable minify/shrink for stability until we have a device crash log
+            isMinifyEnabled = false
+            isShrinkResources = false
             // Signs release APK with debug key so you can install it directly on your phone
             signingConfig = signingConfigs.getByName("debug")
             proguardFiles(

@@ -1,6 +1,5 @@
 package com.stb.mastercontrol.ui.theme
 
-import android.graphics.BlurMaskFilter
 import android.view.HapticFeedbackConstants
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -62,33 +61,26 @@ fun Modifier.neumorphic(
         .drawBehind {
             val radiusPx = cornerRadius.toPx()
             val elevationPx = if (isPressed) (elevation / 2).toPx() else elevation.toPx()
-            val blurPx = (elevationPx * 1.5f).coerceAtLeast(1f)
-
-            // Flip shadow offsets when pressed to simulate a recessed/pushed-in surface
-            val offsetMultiplier = if (isPressed) -0.5f else 1f
-            val offsetPx = elevationPx * offsetMultiplier
 
             lightPaint.asFrameworkPaint().apply {
                 isAntiAlias = true
                 color = NeuColors.LightShadow.toArgb()
-                maskFilter = BlurMaskFilter(blurPx, BlurMaskFilter.Blur.NORMAL)
             }
             darkPaint.asFrameworkPaint().apply {
                 isAntiAlias = true
                 color = NeuColors.DarkShadow.toArgb()
-                maskFilter = BlurMaskFilter(blurPx, BlurMaskFilter.Blur.NORMAL)
             }
 
             drawIntoCanvas { canvas ->
-                // Top-Left Light Highlight
+                // Top-Left Light Highlight (drawing with offset)
                 canvas.save()
-                canvas.translate(-offsetPx, -offsetPx)
+                canvas.translate(0f, 0f)
                 canvas.drawRoundRect(0f, 0f, size.width, size.height, radiusPx, radiusPx, lightPaint)
                 canvas.restore()
 
-                // Bottom-Right Dark Shadow
+                // Bottom-Right Dark Shadow (drawing with offset to simulate depth)
                 canvas.save()
-                canvas.translate(offsetPx, offsetPx)
+                canvas.translate(elevationPx, elevationPx)
                 canvas.drawRoundRect(0f, 0f, size.width, size.height, radiusPx, radiusPx, darkPaint)
                 canvas.restore()
             }
