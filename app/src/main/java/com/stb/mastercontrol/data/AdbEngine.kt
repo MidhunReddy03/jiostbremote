@@ -43,6 +43,10 @@ class AdbEngine(private val context: Context) {
     @Volatile
     private var dadb: Dadb? = null
 
+    /** Whether `input --source mouse roll ...` works on the connected STB. */
+    @Volatile
+    private var mouseSourceSupported: Boolean? = null
+
     private val keyDir: File by lazy {
         File(context.filesDir, "adb").apply { mkdirs() }
     }
@@ -108,6 +112,45 @@ class AdbEngine(private val context: Context) {
         withContext(Dispatchers.IO) {
             withDadb { it.shell("input roll $dx $dy") }
         }
+    }
+
+    /**
+     * Moves the TV mouse pointer.
+     *
+     * We first try `input --source mouse roll dx dy`. Injecting from a real *mouse*
+     * source is what makes many Android TV builds actually render the on-screen
+     * arrow cursor; the touchpad/dpad style `input roll` only moves the
+     * focus rect, which is why the pointer icon was previously invisible.
+     *
+     * Devices whose `input` tool doesn't understand `--source` (older Android)
+     * gracefully fall back to the plain roll command. The support flag is
+     * cached after the first probe.
+     */
+    suspend fun sendMouseRoll(dx: Int, dy: Int): Boolean {
+        if (dx == 0 && dy == 0) return true
+        return withContext(Dispatchers.IO) {
+            withDadb { connection ->
+                if (mouseSourceSupported != false) {
+                    val response = connection.shell("input --source mouse roll $dx $dy")
+                    if (response.exitCode == 0) {
+                        if (mouseSourceSupported == null) mouseSourceSupported = true
+                        return@withDadb true
+                    }
+                    if (mouseSourceSupported == null) mouseSourceSupported = false
+                }
+                connection.shell("input roll $dx $dy").exitCode == 0
+            } ?: false
+        }
+    }
+
+    /**
+     * Nudges the pointer by a single pixel and back. Keeps the on-screen mouse
+     * cursor from being hidden by the TV's power-saving timer while the air
+     * mouse is armed but the user isn't moving.
+     */
+    suspend fun wakePointer() {
+        sendMouseRoll(1, 0)
+        sendMouseRoll(-1, 0)
     }
 
     suspend fun fetchRamStats(): RamStats? = withContext(Dispatchers.IO) {

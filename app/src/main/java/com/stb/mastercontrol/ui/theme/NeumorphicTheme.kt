@@ -27,21 +27,49 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-object NeuColors {
-    val Background = Color(0xFFF0F4F8)       // Off-white / light cool grey
-    val GlassSurface = Color(0xCCFAFBFD)     // Frosted glass overlay
-    val OceanicBlue = Color(0xFFA8C0D8)      // Pastel oceanic blue accent
-    val SoftCoral = Color(0xFFF4C2C2)        // Soft coral/peach accent
-    val MutedSage = Color(0xFFB5C9B8)        // Muted sage green accent
-    val TextPrimary = Color(0xFF2D3748)      // Deep charcoal (No #000000)
-    val TextSecondary = Color(0xFF64748B)    // Soft grey-blue
+data class NeuPalette(
+    val Background: Color,
+    val GlassSurface: Color,
+    val OceanicBlue: Color,
+    val SoftCoral: Color,
+    val MutedSage: Color,
+    val TextPrimary: Color,
+    val TextSecondary: Color,
+    val LightShadow: Color,
+    val DarkShadow: Color
+)
 
-    val LightShadow = Color(0xFFFFFFFF)      // Top-left bright highlight
-    val DarkShadow = Color(0xFFD1D9E6)       // Bottom-right soft shadow
-}
+/** Light / "White" day theme — the original design. */
+val LightNeuColors = NeuPalette(
+    Background = Color(0xFFF0F4F8),          // Off-white / light cool grey
+    GlassSurface = Color(0xCCFAFBFD),        // Frosted glass overlay
+    OceanicBlue = Color(0xFFA8C0D8),         // Pastel oceanic blue accent
+    SoftCoral = Color(0xFFF4C2C2),           // Soft coral/peach accent
+    MutedSage = Color(0xFFB5C9B8),           // Muted sage green accent
+    TextPrimary = Color(0xFF2D3748),         // Deep charcoal (No #000000)
+    TextSecondary = Color(0xFF64748B),       // Soft grey-blue
+    LightShadow = Color(0xFFFFFFFF),         // Top-left bright highlight
+    DarkShadow = Color(0xFFD1D9E6)           // Bottom-right soft shadow
+)
+
+/** Dark / "Night" theme — same neumorphic structure, inverted luminance. */
+val DarkNeuColors = NeuPalette(
+    Background = Color(0xFF151A22),          // Near-black cool slate
+    GlassSurface = Color(0xCC1C222C),        // Frosted glass overlay (dark)
+    OceanicBlue = Color(0xFF3D5A80),         // Desaturated ocean accent
+    SoftCoral = Color(0xFF7A4A4A),           // Muted coral accent
+    MutedSage = Color(0xFF3A4C41),           // Muted sage green accent
+    TextPrimary = Color(0xFFE5E9F0),         // Soft off-white
+    TextSecondary = Color(0xFF8D99A8),       // Soft grey-blue
+    LightShadow = Color(0xFF232B37),         // Raised edge highlight
+    DarkShadow = Color(0xFF0A0D12)           // Recessed edge shadow
+)
+
+val LocalNeuColors = staticCompositionLocalOf { LightNeuColors }
 
 /**
  * Memory-efficient Neumorphic dual-shadow modifier.
@@ -52,8 +80,9 @@ fun Modifier.neumorphic(
     isPressed: Boolean = false,
     cornerRadius: Dp = 24.dp,
     elevation: Dp = 8.dp,
-    backgroundColor: Color = NeuColors.Background
+    backgroundColor: Color = LocalNeuColors.current.Background
 ): Modifier {
+    val colors = LocalNeuColors.current
     val lightPaint = remember { Paint() }
     val darkPaint = remember { Paint() }
 
@@ -64,11 +93,11 @@ fun Modifier.neumorphic(
 
             lightPaint.asFrameworkPaint().apply {
                 isAntiAlias = true
-                color = NeuColors.LightShadow.toArgb()
+                color = colors.LightShadow.toArgb()
             }
             darkPaint.asFrameworkPaint().apply {
                 isAntiAlias = true
-                color = NeuColors.DarkShadow.toArgb()
+                color = colors.DarkShadow.toArgb()
             }
 
             drawIntoCanvas { canvas ->
@@ -117,7 +146,7 @@ fun NeuButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     cornerRadius: Dp = 24.dp,
-    backgroundColor: Color = NeuColors.Background,
+    backgroundColor: Color = LocalNeuColors.current.Background,
     isRecessedDefault: Boolean = false,
     content: @Composable BoxScope.() -> Unit
 ) {

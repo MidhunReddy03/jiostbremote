@@ -10,10 +10,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -27,6 +30,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -42,11 +47,14 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stb.mastercontrol.ui.theme.NeuButton
-import com.stb.mastercontrol.ui.theme.NeuColors
+import com.stb.mastercontrol.ui.theme.DarkNeuColors
+import com.stb.mastercontrol.ui.theme.LightNeuColors
+import com.stb.mastercontrol.ui.theme.LocalNeuColors
 import com.stb.mastercontrol.ui.theme.dashedBorder
 import com.stb.mastercontrol.ui.theme.neumorphic
 import kotlin.math.abs
@@ -59,7 +67,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
-            StbMasterControlApp(state = state, viewModel = viewModel)
+            val isDarkMode by viewModel.isDarkMode.collectAsStateWithLifecycle()
+            CompositionLocalProvider(
+                LocalNeuColors provides (if (isDarkMode) DarkNeuColors else LightNeuColors)
+            ) {
+                StbMasterControlApp(
+                    state = state,
+                    viewModel = viewModel,
+                    isDarkMode = isDarkMode,
+                    onToggleTheme = { viewModel.toggleDarkMode() }
+                )
+            }
         }
     }
 
@@ -84,25 +102,40 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun StbMasterControlApp(state: UiState, viewModel: MainViewModel) {
+fun StbMasterControlApp(
+    state: UiState,
+    viewModel: MainViewModel,
+    isDarkMode: Boolean,
+    onToggleTheme: () -> Unit
+) {
+    val neu = LocalNeuColors.current
     var selectedTab by remember { mutableIntStateOf(0) }
     val isSleeping = state.connectionStatus == ConnectionStatus.SLEEP_OR_OFFLINE
+    val airState by viewModel.airMouseState.collectAsStateWithLifecycle()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(NeuColors.Background)
+            .background(neu.Background)
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = 24.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 1. Minimalist Connection State Pill
-        ConnectionStatusPill(
-            status = state.connectionStatus,
-            hostIp = state.hostIp,
-            onReconnectClick = { viewModel.manualReconnect() }
-        )
+        // 0a. Connection pill + dark-mode toggle share the top row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Spacer(modifier = Modifier.weight(1f))
+            ConnectionStatusPill(
+                status = state.connectionStatus,
+                hostIp = state.hostIp,
+                onReconnectClick = { viewModel.manualReconnect() }
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            ThemeToggleButton(isDarkMode = isDarkMode, onToggle = onToggleTheme)
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -142,6 +175,13 @@ fun StbMasterControlApp(state: UiState, viewModel: MainViewModel) {
                     onRefresh = viewModel::refreshDashboardData,
                     onLaunchApp = viewModel::launchTvApp
                 )
+                3 -> AirMouseTab(
+                    airState = airState,
+                    connected = state.connectionStatus == ConnectionStatus.CONNECTED,
+                    onToggleArm = viewModel::toggleAirMouse,
+                    onSendKey = viewModel::sendKey,
+                    onSensitivityChange = viewModel::setAirMouseSensitivity
+                )
             }
         }
 
@@ -155,12 +195,34 @@ fun StbMasterControlApp(state: UiState, viewModel: MainViewModel) {
     }
 }
 
+// ============================================================================
+// THEME TOGGLE (Light <-> Dark)
+// ============================================================================
+@Composable
+fun ThemeToggleButton(isDarkMode: Boolean, onToggle: () -> Unit) {
+    val neu = LocalNeuColors.current
+    NeuButton(
+        onClick = onToggle,
+        cornerRadius = 21.dp,
+        backgroundColor = neu.Background,
+        modifier = Modifier.size(42.dp)
+    ) {
+        Icon(
+            imageVector = if (isDarkMode) Icons.Outlined.LightMode else Icons.Outlined.DarkMode,
+            contentDescription = if (isDarkMode) "Switch to light theme" else "Switch to dark theme",
+            tint = neu.TextPrimary,
+            modifier = Modifier.size(20.dp)
+        )
+    }
+}
+
 @Composable
 fun ConnectionStatusPill(
     status: ConnectionStatus,
     hostIp: String,
     onReconnectClick: () -> Unit
 ) {
+    val neu = LocalNeuColors.current
     val dotColor = when (status) {
         ConnectionStatus.CONNECTED -> Color(0xFF48BB78) // Soft Sage/Emerald Green
         ConnectionStatus.CONNECTING -> Color(0xFFECC94B) // Warm Amber
@@ -192,7 +254,7 @@ fun ConnectionStatusPill(
             Spacer(modifier = Modifier.width(10.dp))
             Text(
                 text = label,
-                color = NeuColors.TextPrimary,
+                color = neu.TextPrimary,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Medium
             )
@@ -202,11 +264,12 @@ fun ConnectionStatusPill(
 
 @Composable
 fun SleepModeBanner(onWakeClick: () -> Unit) {
+    val neu = LocalNeuColors.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 12.dp)
-            .neumorphic(isPressed = true, cornerRadius = 20.dp, backgroundColor = NeuColors.SoftCoral.copy(alpha = 0.25f))
+            .neumorphic(isPressed = true, cornerRadius = 20.dp, backgroundColor = neu.SoftCoral.copy(alpha = 0.25f))
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
@@ -214,25 +277,25 @@ fun SleepModeBanner(onWakeClick: () -> Unit) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = "STB in Deep Sleep or Offline",
-                color = NeuColors.TextPrimary,
+                color = neu.TextPrimary,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold
             )
             Text(
                 text = "Auto-retrying ADB • Wake via BT or retry",
-                color = NeuColors.TextSecondary,
+                color = neu.TextSecondary,
                 fontSize = 11.sp
             )
         }
         NeuButton(
             onClick = onWakeClick,
             cornerRadius = 16.dp,
-            backgroundColor = NeuColors.SoftCoral,
+            backgroundColor = neu.SoftCoral,
             modifier = Modifier.height(36.dp)
         ) {
             Text(
                 text = "Wake STB",
-                color = NeuColors.TextPrimary,
+                color = neu.TextPrimary,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(horizontal = 14.dp)
@@ -246,6 +309,7 @@ fun SleepModeBanner(onWakeClick: () -> Unit) {
 // ============================================================================
 @Composable
 fun CoreRemoteTab(onKey: (Int) -> Unit) {
+    val neu = LocalNeuColors.current
     val view = LocalView.current
 
     Column(
@@ -258,13 +322,13 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             onClick = { onKey(26) },
             cornerRadius = 44.dp,
             isRecessedDefault = true,
-            backgroundColor = NeuColors.SoftCoral.copy(alpha = 0.35f),
+            backgroundColor = neu.SoftCoral.copy(alpha = 0.35f),
             modifier = Modifier.size(84.dp)
         ) {
             Icon(
                 imageVector = Icons.Outlined.PowerSettingsNew,
                 contentDescription = "Power",
-                tint = NeuColors.TextPrimary,
+                tint = neu.TextPrimary,
                 modifier = Modifier.size(32.dp)
             )
         }
@@ -281,7 +345,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                 .neumorphic(
                     isPressed = false,
                     cornerRadius = 36.dp,
-                    backgroundColor = NeuColors.GlassSurface
+                    backgroundColor = neu.GlassSurface
                 )
                 .pointerInput(Unit) {
                     detectTapGestures(
@@ -330,7 +394,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             Icon(
                 imageVector = Icons.Outlined.KeyboardArrowUp,
                 contentDescription = null,
-                tint = NeuColors.TextSecondary.copy(alpha = 0.4f),
+                tint = neu.TextSecondary.copy(alpha = 0.4f),
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(top = 20.dp)
@@ -338,7 +402,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             Icon(
                 imageVector = Icons.Outlined.KeyboardArrowDown,
                 contentDescription = null,
-                tint = NeuColors.TextSecondary.copy(alpha = 0.4f),
+                tint = neu.TextSecondary.copy(alpha = 0.4f),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 20.dp)
@@ -346,7 +410,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             Icon(
                 imageVector = Icons.Outlined.KeyboardArrowLeft,
                 contentDescription = null,
-                tint = NeuColors.TextSecondary.copy(alpha = 0.4f),
+                tint = neu.TextSecondary.copy(alpha = 0.4f),
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .padding(start = 20.dp)
@@ -354,7 +418,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             Icon(
                 imageVector = Icons.Outlined.KeyboardArrowRight,
                 contentDescription = null,
-                tint = NeuColors.TextSecondary.copy(alpha = 0.4f),
+                tint = neu.TextSecondary.copy(alpha = 0.4f),
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .padding(end = 20.dp)
@@ -369,7 +433,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             ) {
                 Text(
                     text = "OK",
-                    color = NeuColors.TextSecondary,
+                    color = neu.TextSecondary,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
                     letterSpacing = 1.5.sp
@@ -394,7 +458,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                 Icon(
                     imageVector = Icons.Outlined.ArrowBack,
                     contentDescription = "Back",
-                    tint = NeuColors.TextPrimary
+                    tint = neu.TextPrimary
                 )
             }
 
@@ -409,7 +473,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                 Icon(
                     imageVector = Icons.Outlined.Home,
                     contentDescription = "Home",
-                    tint = NeuColors.TextPrimary
+                    tint = neu.TextPrimary
                 )
             }
 
@@ -417,7 +481,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
             NeuButton(
                 onClick = { onKey(231) },
                 cornerRadius = 28.dp,
-                backgroundColor = NeuColors.OceanicBlue.copy(alpha = 0.35f),
+                backgroundColor = neu.OceanicBlue.copy(alpha = 0.35f),
                 modifier = Modifier
                     .weight(1f)
                     .height(64.dp)
@@ -425,7 +489,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                 Icon(
                     imageVector = Icons.Outlined.Mic,
                     contentDescription = "Assistant",
-                    tint = NeuColors.TextPrimary
+                    tint = neu.TextPrimary
                 )
             }
 
@@ -448,7 +512,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                     Icon(
                         imageVector = Icons.Outlined.VolumeDown,
                         contentDescription = "Vol -",
-                        tint = NeuColors.TextPrimary,
+                        tint = neu.TextPrimary,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -462,7 +526,7 @@ fun CoreRemoteTab(onKey: (Int) -> Unit) {
                     Icon(
                         imageVector = Icons.Outlined.VolumeUp,
                         contentDescription = "Vol +",
-                        tint = NeuColors.TextPrimary,
+                        tint = neu.TextPrimary,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -481,6 +545,7 @@ fun TrackpadKeyboardTab(
     onSendText: (String) -> Unit,
     onBackspace: () -> Unit
 ) {
+    val neu = LocalNeuColors.current
     val view = LocalView.current
     var inputText by remember { mutableStateOf("") }
 
@@ -498,7 +563,7 @@ fun TrackpadKeyboardTab(
         ) {
             Text(
                 text = "SMART TEXT PUSH",
-                color = NeuColors.TextSecondary,
+                color = neu.TextSecondary,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 1.2.sp
@@ -521,7 +586,7 @@ fun TrackpadKeyboardTab(
                     if (inputText.isEmpty()) {
                         Text(
                             text = "Paste URL or password...",
-                            color = NeuColors.TextSecondary.copy(alpha = 0.6f),
+                            color = neu.TextSecondary.copy(alpha = 0.6f),
                             fontSize = 14.sp
                         )
                     }
@@ -530,7 +595,7 @@ fun TrackpadKeyboardTab(
                         onValueChange = { inputText = it },
                         singleLine = true,
                         textStyle = TextStyle(
-                            color = NeuColors.TextPrimary,
+                            color = neu.TextPrimary,
                             fontSize = 14.sp
                         ),
                         modifier = Modifier.fillMaxWidth()
@@ -546,7 +611,7 @@ fun TrackpadKeyboardTab(
                     Icon(
                         imageVector = Icons.Outlined.Backspace,
                         contentDescription = "Backspace",
-                        tint = NeuColors.TextPrimary,
+                        tint = neu.TextPrimary,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -560,14 +625,14 @@ fun TrackpadKeyboardTab(
                         }
                     },
                     cornerRadius = 18.dp,
-                    backgroundColor = NeuColors.OceanicBlue,
+                    backgroundColor = neu.OceanicBlue,
                     modifier = Modifier
                         .height(50.dp)
                         .padding(horizontal = 4.dp)
                 ) {
                     Text(
                         text = "Send",
-                        color = NeuColors.TextPrimary,
+                        color = neu.TextPrimary,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 14.sp,
                         modifier = Modifier.padding(horizontal = 16.dp)
@@ -584,7 +649,7 @@ fun TrackpadKeyboardTab(
                 .neumorphic(
                     isPressed = true,
                     cornerRadius = 32.dp,
-                    backgroundColor = NeuColors.GlassSurface
+                    backgroundColor = neu.GlassSurface
                 )
                 .pointerInput(Unit) {
                     detectTapGestures(
@@ -606,13 +671,13 @@ fun TrackpadKeyboardTab(
                 Icon(
                     imageVector = Icons.Outlined.TouchApp,
                     contentDescription = null,
-                    tint = NeuColors.TextSecondary.copy(alpha = 0.45f),
+                    tint = neu.TextSecondary.copy(alpha = 0.45f),
                     modifier = Modifier.size(36.dp)
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = "Glide to Move Cursor • Tap to Click",
-                    color = NeuColors.TextSecondary.copy(alpha = 0.65f),
+                    color = neu.TextSecondary.copy(alpha = 0.65f),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -632,6 +697,7 @@ fun PowerUserDashboardTab(
     onRefresh: () -> Unit,
     onLaunchApp: (String) -> Unit
 ) {
+    val neu = LocalNeuColors.current
     val view = LocalView.current
     val apkPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -655,10 +721,10 @@ fun PowerUserDashboardTab(
                 .neumorphic(
                     isPressed = true,
                     cornerRadius = 28.dp,
-                    backgroundColor = NeuColors.OceanicBlue.copy(alpha = 0.16f)
+                    backgroundColor = neu.OceanicBlue.copy(alpha = 0.16f)
                 )
                 .dashedBorder(
-                    color = NeuColors.OceanicBlue,
+                    color = neu.OceanicBlue,
                     cornerRadius = 28.dp
                 )
                 .clip(RoundedCornerShape(28.dp))
@@ -676,15 +742,15 @@ fun PowerUserDashboardTab(
                 ) {
                     Text(
                         text = state.statusMessage ?: "Installing APK...",
-                        color = NeuColors.TextPrimary,
+                        color = neu.TextPrimary,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     LinearProgressIndicator(
                         progress = { state.sideloadProgress ?: 0f },
-                        color = NeuColors.OceanicBlue,
-                        trackColor = NeuColors.Background,
+                        color = neu.OceanicBlue,
+                        trackColor = neu.Background,
                         modifier = Modifier
                             .fillMaxWidth(0.8f)
                             .height(8.dp)
@@ -696,19 +762,19 @@ fun PowerUserDashboardTab(
                     Icon(
                         imageVector = Icons.Outlined.CloudUpload,
                         contentDescription = "Sideload APK",
-                        tint = NeuColors.TextPrimary,
+                        tint = neu.TextPrimary,
                         modifier = Modifier.size(30.dp)
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = "Tap to Sideload .APK to Jio STB",
-                        color = NeuColors.TextPrimary,
+                        color = neu.TextPrimary,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
                         text = state.statusMessage ?: "Pushes & installs silently via ADB",
-                        color = NeuColors.TextSecondary,
+                        color = neu.TextSecondary,
                         fontSize = 12.sp
                     )
                 }
@@ -739,14 +805,14 @@ fun PowerUserDashboardTab(
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         val stroke = 10.dp.toPx()
                         drawArc(
-                            color = NeuColors.DarkShadow,
+                            color = neu.DarkShadow,
                             startAngle = 135f,
                             sweepAngle = 270f,
                             useCenter = false,
                             style = Stroke(width = stroke, cap = StrokeCap.Round)
                         )
                         drawArc(
-                            color = NeuColors.MutedSage,
+                            color = neu.MutedSage,
                             startAngle = 135f,
                             sweepAngle = 270f * (1f - state.ramStats.usedFraction),
                             useCenter = false,
@@ -756,13 +822,13 @@ fun PowerUserDashboardTab(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
                             text = "${state.ramStats.freeMb}",
-                            color = NeuColors.TextPrimary,
+                            color = neu.TextPrimary,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
                             text = "MB Free",
-                            color = NeuColors.TextSecondary,
+                            color = neu.TextSecondary,
                             fontSize = 10.sp
                         )
                     }
@@ -770,7 +836,7 @@ fun PowerUserDashboardTab(
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
                     text = "Free RAM: ~${state.ramStats.freeMb} MB",
-                    color = NeuColors.TextPrimary,
+                    color = neu.TextPrimary,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -780,7 +846,7 @@ fun PowerUserDashboardTab(
             NeuButton(
                 onClick = onCleanCache,
                 cornerRadius = 28.dp,
-                backgroundColor = NeuColors.MutedSage.copy(alpha = 0.25f),
+                backgroundColor = neu.MutedSage.copy(alpha = 0.25f),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
@@ -792,26 +858,26 @@ fun PowerUserDashboardTab(
                     Box(
                         modifier = Modifier
                             .size(54.dp)
-                            .neumorphic(cornerRadius = 27.dp, backgroundColor = NeuColors.Background),
+                            .neumorphic(cornerRadius = 27.dp, backgroundColor = neu.Background),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Outlined.CleaningServices,
                             contentDescription = "Clean Cache",
-                            tint = NeuColors.TextPrimary,
+                            tint = neu.TextPrimary,
                             modifier = Modifier.size(24.dp)
                         )
                     }
                     Spacer(modifier = Modifier.height(14.dp))
                     Text(
                         text = "1-Tap Cleaner",
-                        color = NeuColors.TextPrimary,
+                        color = neu.TextPrimary,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
                         text = "Trim 1000M Cache",
-                        color = NeuColors.TextSecondary,
+                        color = neu.TextSecondary,
                         fontSize = 11.sp
                     )
                 }
@@ -834,14 +900,14 @@ fun PowerUserDashboardTab(
             ) {
                 Text(
                     text = "QUICK APP LAUNCHERS",
-                    color = NeuColors.TextSecondary,
+                    color = neu.TextSecondary,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     letterSpacing = 1.2.sp
                 )
                 Text(
                     text = "${state.installedApps.size} apps",
-                    color = NeuColors.TextSecondary,
+                    color = neu.TextSecondary,
                     fontSize = 11.sp
                 )
             }
@@ -853,7 +919,7 @@ fun PowerUserDashboardTab(
                 ) {
                     Text(
                         text = "Connect to STB to load installed TV apps",
-                        color = NeuColors.TextSecondary,
+                        color = neu.TextSecondary,
                         fontSize = 12.sp
                     )
                 }
@@ -879,12 +945,12 @@ fun PowerUserDashboardTab(
                                     modifier = Modifier
                                         .size(36.dp)
                                         .clip(CircleShape)
-                                        .background(NeuColors.OceanicBlue.copy(alpha = 0.45f)),
+                                        .background(neu.OceanicBlue.copy(alpha = 0.45f)),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
                                         text = app.label.take(2).uppercase(),
-                                        color = NeuColors.TextPrimary,
+                                        color = neu.TextPrimary,
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Bold
                                     )
@@ -892,7 +958,7 @@ fun PowerUserDashboardTab(
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
                                     text = app.label,
-                                    color = NeuColors.TextPrimary,
+                                    color = neu.TextPrimary,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
                                     maxLines = 1,
@@ -909,6 +975,163 @@ fun PowerUserDashboardTab(
 }
 
 // ============================================================================
+// TAB 4: THE AIR MOUSE (Phone gyro -> TV cursor)
+// ============================================================================
+@Composable
+fun AirMouseTab(
+    airState: AirMouseState,
+    connected: Boolean,
+    onToggleArm: () -> Unit,
+    onSendKey: (Int) -> Unit,
+    onSensitivityChange: (Float) -> Unit
+) {
+    val neu = LocalNeuColors.current
+    val view = LocalView.current
+    val live: Boolean = airState.armed && connected
+
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        // Gyro ball visualiser
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .padding(vertical = 16.dp)
+                .neumorphic(
+                    isPressed = airState.armed,
+                    cornerRadius = 36.dp,
+                    backgroundColor = neu.GlassSurface
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            // Crosshair
+            Box(
+                modifier = Modifier
+                    .size(180.dp)
+                    .clip(CircleShape)
+                    .border(2.dp, neu.DarkShadow.copy(alpha = 0.35f), CircleShape)
+            )
+            // The moving pointer that mirrors the TV cursor
+            val offsetX by animateDpAsState(
+                targetValue = (airState.pointerX * 74f).dp,
+                animationSpec = tween(durationMillis = 40),
+                label = "air_pointer_x"
+            )
+            val offsetY by animateDpAsState(
+                targetValue = (airState.pointerY * 74f).dp,
+                animationSpec = tween(durationMillis = 40),
+                label = "air_pointer_y"
+            )
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .offset(x = offsetX, y = offsetY)
+                    .clip(CircleShape)
+                    .background(if (live) neu.SoftCoral else neu.TextSecondary.copy(alpha = 0.6f))
+            )
+            Text(
+                text = if (airState.armed) "[" + "Gyro live" + "]" else "Tilt to move",
+                color = neu.TextSecondary,
+                fontSize = 11.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Sensitivity slider
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(text = "Sensitivity", color = neu.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(text = "x%.1f".format(airState.sensitivity), color = neu.TextSecondary, fontSize = 11.sp)
+            }
+            Slider(
+                value = airState.sensitivity,
+                onValueChange = onSensitivityChange,
+                valueRange = 0.5f..3f,
+                colors = SliderDefaults.colors(
+                    thumbColor = neu.OceanicBlue,
+                    activeTrackColor = neu.OceanicBlue.copy(alpha = 0.8f),
+                    inactiveTrackColor = neu.DarkShadow.copy(alpha = 0.15f)
+                )
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Back
+            NeuButton(
+                onClick = { onSendKey(4) },
+                cornerRadius = 24.dp,
+                modifier = Modifier.weight(1f).height(48.dp)
+            ) { Text(text = "Back", color = neu.TextPrimary, fontSize = 13.sp) }
+            // OK / Center Select
+            NeuButton(
+                onClick = { onSendKey(66) },
+                cornerRadius = 24.dp,
+                modifier = Modifier.weight(1f).height(48.dp)
+            ) { Text(text = "OK", color = neu.TextPrimary, fontSize = 13.sp) }
+            // Home
+            NeuButton(
+                onClick = { onSendKey(3) },
+                cornerRadius = 24.dp,
+                modifier = Modifier.weight(1f).height(48.dp)
+            ) { Text(text = "Home", color = neu.TextPrimary, fontSize = 13.sp) }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        NeuButton(
+            onClick = onToggleArm,
+            cornerRadius = 30.dp,
+            backgroundColor = if (airState.armed) neu.SoftCoral.copy(alpha = 0.45f)
+                              else neu.OceanicBlue.copy(alpha = 0.4f),
+            modifier = Modifier.height(56.dp).fillMaxWidth()
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.padding(horizontal = 12.dp)
+            ) {
+                Icon(
+                    imageVector = if (airState.armed) Icons.Outlined.Pause else Icons.Outlined.PlayArrow,
+                    contentDescription = null,
+                    tint = neu.TextPrimary,
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = if (airState.armed) "Stop Air Mouse" else "Start Air Mouse",
+                    color = neu.TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = if (live) "Move the phone like a pointing stick — the TV mouse cursor follows you."
+                   else if (airState.armed) "Reconnecting..." else "The TV cursor appears as soon as you start.",
+            color = neu.TextSecondary,
+            fontSize = 11.sp,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+// ============================================================================
 // BOTTOM PILL NAVIGATION BAR
 // ============================================================================
 @Composable
@@ -916,10 +1139,12 @@ fun NeumorphicBottomTabBar(
     selectedTab: Int,
     onTabSelected: (Int) -> Unit
 ) {
+    val neu = LocalNeuColors.current
     val tabs = listOf(
         "Remote" to Icons.Outlined.SettingsRemote,
         "Trackpad" to Icons.Outlined.TouchApp,
-        "Dashboard" to Icons.Outlined.Dashboard
+        "Dashboard" to Icons.Outlined.Dashboard,
+        "Air Mouse" to Icons.Outlined.Airplay
     )
 
     Row(
@@ -936,7 +1161,7 @@ fun NeumorphicBottomTabBar(
                 onClick = { onTabSelected(index) },
                 cornerRadius = 26.dp,
                 isRecessedDefault = !isSelected,
-                backgroundColor = if (isSelected) NeuColors.OceanicBlue.copy(alpha = 0.4f) else Color.Transparent,
+                backgroundColor = if (isSelected) neu.OceanicBlue.copy(alpha = 0.4f) else Color.Transparent,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
@@ -948,13 +1173,13 @@ fun NeumorphicBottomTabBar(
                     Icon(
                         imageVector = icon,
                         contentDescription = title,
-                        tint = NeuColors.TextPrimary,
+                        tint = neu.TextPrimary,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = title,
-                        color = NeuColors.TextPrimary,
+                        color = neu.TextPrimary,
                         fontSize = 12.sp,
                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
                     )
