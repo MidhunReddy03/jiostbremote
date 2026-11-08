@@ -106,7 +106,8 @@ class BtMouseController(private val context: Context) {
                     update {
                         it.copy(
                             connected = true,
-                            connectedName = device?.name ?: device?.address
+                            connectedName = device?.name ?: device?.address,
+                            status = ""
                         )
                     }
                 }
@@ -118,6 +119,19 @@ class BtMouseController(private val context: Context) {
                     }
                 }
                 else -> update { it.copy(connected = false, connectedName = null) }
+            }
+        }
+
+        override fun onVirtualCableUnplug(device: BluetoothDevice) {
+            if (host?.address == device.address) {
+                host = null
+                update {
+                    it.copy(
+                        connected = false,
+                        connectedName = null,
+                        status = "TV unplugged the mouse — tap it again to reconnect"
+                    )
+                }
             }
         }
     }
@@ -152,7 +166,18 @@ class BtMouseController(private val context: Context) {
                 adapterOn = supported && runCatching { a?.isEnabled }.getOrDefault(false) == true
             )
         }
-        if (!supported || !granted) return false
+        if (!supported) {
+            update { it.copy(status = if (!sdkOk) "Needs Android 9+" else "No Bluetooth hardware") }
+            return false
+        }
+        if (!granted) {
+            update { it.copy(status = "Bluetooth permission missing") }
+            return false
+        }
+        if (runCatching { a?.isEnabled }.getOrDefault(false) != true) {
+            update { it.copy(status = "Bluetooth is off — turn it on in quick settings") }
+            return false
+        }
         return try {
             a!!.getProfileProxy(context, serviceListener, BluetoothProfile.HID_DEVICE)
         } catch (t: Throwable) {
@@ -190,7 +215,7 @@ class BtMouseController(private val context: Context) {
                 hidCallback
             )
         }.getOrDefault(false)
-        update { if (ok) it.copy(registered = true, status = "") else it.copy(status = "Registration refused") }
+        update { if (ok) it.copy(registered = true, status = "Registered as mouse — make the phone visible, then pair on the TV") else it.copy(status = "Registration refused") }
     }
 
     /** Lists paired devices so the user can pick the STB. */
@@ -210,9 +235,27 @@ class BtMouseController(private val context: Context) {
 
     /** Initiates the HID connection to the STB (as the device role). */
     fun connectTo(peer: BtPeer): Boolean {
-        val hid = hidDevice ?: return false
-        val device = adapter?.getRemoteDevice(peer.mac) ?: return false
-        return runCatching { hid.connect(device) }.getOrDefault(false)
+        val hid = hidDevice
+        if (hid == null) {
+            update { it.copy(status = "HID not ready — tap Bluetooth again") }
+            return false
+        }
+        val device = adapter?.getRemoteDevice(peer.mac)
+        if (device == null) {
+            update { it.copy(status = "Unknown device") }
+            return false
+        }
+        val bonded = runCatching { device.bondState == BluetoothDevice.BOND_BONDED }
+            .getOrDefault(false)
+        if (!bonded) {
+            update {
+                it.copy(status = "${peer.name} not bonded — use Make visible, pair on the TV, then tap again")
+            }
+            return false
+        }
+        val ok = runCatching { hid.connect(device) }.getOrDefault(false)
+        if (!ok) update { it.copy(status = "Connect refused by system") }
+        return ok
     }
 
     fun disconnect() {

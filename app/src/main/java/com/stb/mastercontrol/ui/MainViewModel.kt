@@ -7,12 +7,16 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.net.Uri
+import android.content.Intent
 import android.view.Surface
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.stb.mastercontrol.data.AdbEngine
 import com.stb.mastercontrol.data.BtMouseController
 import com.stb.mastercontrol.data.BtMouseController.BtPeer
+import com.stb.mastercontrol.data.MicStreamBus
+import com.stb.mastercontrol.data.MicStreamService
 import com.stb.mastercontrol.data.RamStats
 import com.stb.mastercontrol.data.TvApp
 import kotlinx.coroutines.delay
@@ -60,7 +64,9 @@ data class AirMouseState(
     /** Paired Bluetooth devices the user can pick the TV from. */
     val btPeers: List<BtPeer> = emptyList(),
     /** Latest Bluetooth status / error line. */
-    val btStatus: String = ""
+    val btStatus: String = "",
+    /** Incremented whenever the UI should show the system "make visible" prompt. */
+    val discoverableNonce: Int = 0
 )
 
 data class UiState(
@@ -114,6 +120,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val sensorLock = Any()
     private var sensorListener: SensorEventListener? = null
     @Volatile private var lastAirMouseActivity = 0L
+    @Volatile private var lastBtKeepalive = 0L
 
     /** Latest absolute orientation, in radians, from the rotation-vector sensor. */
     @Volatile private var currentYaw = 0f
@@ -148,6 +155,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
+        }
+        viewModelScope.launch {
+            MicStreamBus.state.collect { mic -> _micState.value = mic }
         }
     }
 
@@ -250,6 +260,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         if (dx != 0 || dy != 0) {
                             lastAirMouseActivity = System.currentTimeMillis()
                             btMouse.sendMove(dx.coerceIn(-100, 100), dy.coerceIn(-100, 100))
+                        }
+                        // HID hosts drop silent mice; emit a zero-report every 2s.
+                        val now = System.currentTimeMillis()
+                        if (now - lastAirMouseActivity > BT_IDLE_KEEPALIVE_MS &&
+                            now - lastBtKeepalive > BT_IDLE_KEEPALIVE_MS
+                        ) {
+                            btMouse.sendMove(0, 0)
+                            lastBtKeepalive = now
                         }
                     } else {
                         val combinedX = rawX + leftoverX.getAndSet(0)
@@ -472,6 +490,114 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Asks the UI to raise Android's stock "make this phone visible" prompt so
+     * the TV can find and bond with it. Pairing MUST start from the TV side
+     * (Settings → Bluetooth → search); the phone just needs to be broadcastable.
+     */
+    fun requestBtDiscoverable() {
+        _airMouseState.update { it.copy(discoverableNonce = it.discoverableNonce + 1) }
+    }
+
+    /** Called after the visibility prompt window closed (accepted or cancelled). */
+    fun onDiscoverablePromptClosed() {
+        btMouse.start()
+        refreshBtPeers()
+    }
+
+    // ---------------------------------------------------------------------
+    // Live mic streaming to the PC over the LAN
+    // ---------------------------------------------------------------------
+
+    private val _micState = MutableStateFlow(MicStreamBus.state.value)
+    val micState: StateFlow<MicStreamBus.MicState> = _micState.asStateFlow()
+
+    /** Current mic-stream target ("192.168.29.51:5005" style). */
+    fun micTargetIp(): String {
+        val stored = runCatching {
+            getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_MIC_TARGET, "")
+        }.getOrNull().orEmpty()
+        if (stored.isNotBlank()) return stored
+        // Auto-subnet suggestion from the STB's own address: same Wi-Fi LAN.
+        val stbIp = _uiState.value.hostIp
+        val dot = stbIp.lastIndexOf('.')
+        return if (dot > 0) stbIp.substring(0, dot + 1) else ""
+    }
+
+    fun setMicTargetIp(raw: String) {
+        val ip = raw.trim()
+        runCatching {
+            getApplication<Application>()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_MIC_TARGET, ip)
+                .apply()
+        }
+    }
+
+    private fun startMicAction(ip: String, port: Int, burstMs: Long) {
+        val full = if (ip.contains(":")) ip else "$ip:$port"
+        setMicTargetIp(full)
+        val intent = Intent(getApplication<Application>(), MicStreamService::class.java).apply {
+            action = MicStreamService.ACTION_START
+            putExtra(MicStreamService.EXTRA_TARGET_IP, ip)
+            putExtra(MicStreamService.EXTRA_TARGET_PORT, port)
+            putExtra(MicStreamService.EXTRA_BURST_MS, burstMs)
+        }
+        runCatching {
+            ContextCompat.startForegroundService(getApplication<Application>(), intent)
+        }.onFailure {
+            _uiState.update { s -> s.copy(statusMessage = "Could not start mic service") }
+        }
+    }
+
+    /** Streams mic audio until [stopMicStreaming] is called. */
+    fun startMicStreaming() {
+        val target = micTargetIp()
+        val ip = target.substringBefore(':')
+        val port = target.substringAfter(':', "5005").toIntOrNull() ?: 5005
+        if (!Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$").matches(ip)) {
+            _uiState.update { it.copy(statusMessage = "Type the full PC IP first, e.g. 192.168.29.51") }
+            return
+        }
+        startMicAction(ip, port, 0L)
+    }
+
+    /** One-push burst: quick capture, auto-stops — "grab a packet". */
+    fun sendMicBurst(ms: Long = 5000L) {
+        val target = micTargetIp()
+        val ip = target.substringBefore(':')
+        val port = target.substringAfter(':', "5005").toIntOrNull() ?: 5005
+        if (!Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$").matches(ip)) {
+            _uiState.update { it.copy(statusMessage = "Type the full PC IP first, e.g. 192.168.29.51") }
+            return
+        }
+        startMicAction(ip, port, ms)
+    }
+
+    fun stopMicStreaming() {
+        val intent = Intent(getApplication<Application>(), MicStreamService::class.java).apply {
+            action = MicStreamService.ACTION_STOP
+        }
+        runCatching {
+            getApplication<Application>().startService(intent)
+        }
+    }
+
+    /** True when RECORD_AUDIO is already granted. */
+    fun hasMicPermission(): Boolean =
+        runCatching {
+            ContextCompat.checkSelfPermission(
+                getApplication<Application>(), android.Manifest.permission.RECORD_AUDIO
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+
+    /** Shown when RECORD_AUDIO is denied — streaming stays off. */
+    fun onMicPermissionDenied() {
+        _uiState.update { it.copy(statusMessage = "Mic permission denied — streaming unavailable") }
+    }
+
     // ---------------------------------------------------------------------
     // One-time calibration wizard
     // ---------------------------------------------------------------------
@@ -620,6 +746,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_AIR_CALIBRATED = "air_calibrated"
         private const val KEY_AIR_SHOW_POINTER = "air_show_pointer"
         private const val KEY_AIR_BT_TRANSPORT = "air_bt_transport"
+        private const val KEY_MIC_TARGET = "mic_target_ip"
         private const val KEY_AIR_REST_YAW = "air_rest_yaw"
         private const val KEY_AIR_REST_PITCH = "air_rest_pitch"
 
@@ -629,6 +756,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         /** Milli-units per Bluetooth HID report count (1 count ≈ 1 cursor step). */
         private const val BT_MILLI_PER_REPORT = 120
         private const val CURSOR_KEEPALIVE_MS = 3000L
+        private const val BT_IDLE_KEEPALIVE_MS = 2000L
 
         private fun readDarkModePref(app: Application): Boolean = runCatching {
             app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

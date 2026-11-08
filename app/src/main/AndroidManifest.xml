@@ -10,6 +10,14 @@
     <!-- Runtime permission on Android 12+ (API 31+). -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Live mic streaming to the PC over the LAN.
+         "neverForLocation": the mic stream is used for audio only, never for location inference. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:label="STB Control"
@@ -24,5 +32,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".data.MicStreamService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>

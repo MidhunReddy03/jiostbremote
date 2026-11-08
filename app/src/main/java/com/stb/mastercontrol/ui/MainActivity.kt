@@ -1,6 +1,8 @@
 package com.stb.mastercontrol.ui
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -41,7 +43,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -61,6 +65,7 @@ import com.stb.mastercontrol.ui.theme.LightNeuColors
 import com.stb.mastercontrol.ui.theme.LocalNeuColors
 import com.stb.mastercontrol.ui.theme.dashedBorder
 import com.stb.mastercontrol.data.BtMouseController.BtPeer
+import com.stb.mastercontrol.data.MicStreamBus
 import com.stb.mastercontrol.ui.theme.neumorphic
 import kotlin.math.abs
 
@@ -117,6 +122,7 @@ fun StbMasterControlApp(
     var selectedTab by remember { mutableIntStateOf(0) }
     val isSleeping = state.connectionStatus == ConnectionStatus.SLEEP_OR_OFFLINE
     val airState by viewModel.airMouseState.collectAsStateWithLifecycle()
+    val micState by viewModel.micState.collectAsStateWithLifecycle()
 
     Column(
         modifier = Modifier
@@ -188,6 +194,18 @@ fun StbMasterControlApp(
                         viewModel.onBluetoothPermissionResult()
                         if (!granted) viewModel.onBluetoothDenied()
                     }
+                    // System "make this phone visible" window so the TV can pair.
+                    val discoverableLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.StartActivityForResult()
+                    ) { viewModel.onDiscoverablePromptClosed() }
+                    LaunchedEffect(airState.discoverableNonce) {
+                        if (airState.discoverableNonce > 0) {
+                            val intent = Intent(
+                                BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE
+                            ).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                            discoverableLauncher.launch(intent)
+                        }
+                    }
                     AirMouseTab(
                         airState = airState,
                         connected = state.connectionStatus == ConnectionStatus.CONNECTED,
@@ -215,7 +233,32 @@ fun StbMasterControlApp(
                                 btLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
                             }
                         },
-                        onDisconnectBt = viewModel::disconnectBt
+                        onDisconnectBt = viewModel::disconnectBt,
+                        onMakeBtVisible = viewModel::requestBtDiscoverable
+                    )
+                }
+                4 -> {
+                    // RECORD_AUDIO (+ notifications on 13+) is a runtime grant.
+                    val micLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestMultiplePermissions()
+                    ) { grants ->
+                        val audioGranted = grants[Manifest.permission.RECORD_AUDIO] == true
+                        if (audioGranted) viewModel.startMicStreaming()
+                        else viewModel.onMicPermissionDenied()
+                    }
+                    MicTab(
+                        mic = micState,
+                        onTargetIpChange = viewModel::setMicTargetIp,
+                        currentTarget = { viewModel.micTargetIp() },
+                        onToggleStream = {
+                            if (micState.streaming) viewModel.stopMicStreaming()
+                            else if (viewModel.hasMicPermission()) viewModel.startMicStreaming()
+                            else micLauncher.launch(micPermissionsForSdk())
+                        },
+                        onSendBurst = {
+                            if (viewModel.hasMicPermission()) viewModel.sendMicBurst()
+                            else micLauncher.launch(micPermissionsForSdk())
+                        }
                     )
                 }
             }
@@ -227,6 +270,192 @@ fun StbMasterControlApp(
         NeumorphicBottomTabBar(
             selectedTab = selectedTab,
             onTabSelected = { selectedTab = it }
+        )
+    }
+}
+
+// ============================================================================
+// TAB 5: MIC STREAM (Phone mic -> PC over LAN)
+// ============================================================================
+/** RECORD_AUDIO first; notifications permission only on Android 13+. */
+private fun micPermissionsForSdk(): Array<String> = buildList {
+    add(Manifest.permission.RECORD_AUDIO)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}.toTypedArray()
+
+@Composable
+fun MicTab(
+    mic: MicStreamBus.MicState,
+    onTargetIpChange: (String) -> Unit,
+    currentTarget: () -> String,
+    onToggleStream: () -> Unit,
+    onSendBurst: () -> Unit
+) {
+    val neu = LocalNeuColors.current
+    // Seed the field with the saved/auto-subnet value once, then edit freely.
+    var ipText by remember(mic.target.isEmpty()) { mutableStateOf(currentTarget()) }
+    var focused by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Status card
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .neumorphic(cornerRadius = 24.dp, backgroundColor = neu.GlassSurface)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .clip(CircleShape)
+                    .background(
+                        when {
+                            mic.streaming && !mic.burst -> neu.MutedSage
+                            mic.burst -> neu.OceanicBlue
+                            else -> neu.TextSecondary.copy(alpha = 0.4f)
+                        }
+                    )
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = when {
+                        mic.streaming && !mic.burst -> "Mic live → ${mic.target}"
+                        mic.burst -> "Capturing a quick burst…"
+                        else -> "Idle"
+                    },
+                    color = neu.TextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "16 kHz · mono · UDP 5005",
+                    color = neu.TextSecondary,
+                    fontSize = 10.sp
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Target IP field
+        Text(
+            text = "PC target address",
+            color = neu.TextPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.fillMaxWidth().align(Alignment.Start)
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .neumorphic(
+                    isPressed = focused,
+                    cornerRadius = 18.dp,
+                    backgroundColor = neu.Background
+                )
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            BasicTextField(
+                value = ipText,
+                onValueChange = {
+                    ipText = it
+                    onTargetIpChange(it)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focused = it.isFocused },
+                singleLine = true,
+                textStyle = TextStyle(color = neu.TextPrimary, fontSize = 14.sp),
+                cursorBrush = SolidColor(neu.OceanicBlue),
+                decorationBox = { inner ->
+                    if (ipText.isEmpty() && !focused) {
+                        Text(
+                            text = "192.168.29.__",
+                            color = neu.TextSecondary.copy(alpha = 0.6f),
+                            fontSize = 14.sp
+                        )
+                    }
+                    inner()
+                }
+            )
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Big hold-to-stream button
+        NeuButton(
+            onClick = onToggleStream,
+            cornerRadius = 28.dp,
+            backgroundColor = when {
+                mic.streaming -> neu.SoftCoral.copy(alpha = 0.5f)
+                else -> neu.MutedSage.copy(alpha = 0.45f)
+            },
+            modifier = Modifier.height(58.dp).fillMaxWidth()
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    imageVector = if (mic.streaming) Icons.Outlined.Stop else Icons.Outlined.Mic,
+                    contentDescription = null,
+                    tint = neu.TextPrimary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = if (mic.streaming) "Stop streaming" else "Stream mic to PC",
+                    color = neu.TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Small one-push burst capture icon
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            NeuButton(
+                onClick = onSendBurst,
+                cornerRadius = 18.dp,
+                backgroundColor = neu.OceanicBlue.copy(alpha = 0.3f),
+                modifier = Modifier.size(44.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Bolt,
+                    contentDescription = "Quick 5 s capture",
+                    tint = neu.TextPrimary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = "Quick burst — 5 s capture, auto-stops",
+                color = neu.TextSecondary,
+                fontSize = 11.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        Text(
+            text = "Run mic_receiver.py on the PC, type its LAN IP above, then stream. "
+                + "Audio flows straight over this room's Wi-Fi — nothing touches the STB.",
+            color = neu.TextSecondary,
+            fontSize = 10.sp,
+            textAlign = TextAlign.Center
         )
     }
 }
@@ -1029,7 +1258,8 @@ fun AirMouseTab(
     onRequestBtPermission: () -> Unit,
     onRefreshBtPeers: () -> Unit,
     onConnectBtPeer: (BtPeer) -> Unit,
-    onDisconnectBt: () -> Unit
+    onDisconnectBt: () -> Unit,
+    onMakeBtVisible: () -> Unit
 ) {
     val neu = LocalNeuColors.current
     val animatedX by animateDpAsState(
@@ -1083,62 +1313,94 @@ fun AirMouseTab(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Sensitivity + visibility controls
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "Sensitivity",
-                    color = neu.TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    text = "x%.1f".format(airState.sensitivity),
-                    color = neu.TextSecondary,
-                    fontSize = 11.sp
-                )
-            }
-            Slider(
-                value = airState.sensitivity,
-                onValueChange = onSensitivityChange,
-                valueRange = 0.5f..3f,
-                colors = SliderDefaults.colors(
-                    thumbColor = neu.OceanicBlue,
-                    activeTrackColor = neu.OceanicBlue.copy(alpha = 0.8f),
-                    inactiveTrackColor = neu.DarkShadow.copy(alpha = 0.18f)
-                )
+        // Collapsible settings row (keeps the tab airy)
+        var settingsOpen by remember { mutableStateOf(false) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = when {
+                    airState.transport == AirMouseTransport.BLUETOOTH && airState.cursorViaBluetooth ->
+                        "Bluetooth HID — the TV draws a real cursor"
+                    airState.transport == AirMouseTransport.BLUETOOTH ->
+                        "Bluetooth HID — waiting for the TV"
+                    else -> "Legacy ADB cursor"
+                },
+                color = neu.TextSecondary,
+                fontSize = 11.sp,
+                modifier = Modifier.weight(1f)
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
+            NeuButton(
+                onClick = { settingsOpen = !settingsOpen },
+                cornerRadius = 14.dp,
+                modifier = Modifier.size(34.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Outlined.Mouse,
-                    contentDescription = null,
-                    tint = neu.TextSecondary,
+                    imageVector = Icons.Outlined.Tune,
+                    contentDescription = "Settings",
+                    tint = neu.TextPrimary,
                     modifier = Modifier.size(16.dp)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Column(modifier = Modifier.weight(1f)) {
+            }
+        }
+        AnimatedVisibility(visible = settingsOpen) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
                     Text(
-                        text = "Show cursor on TV",
+                        text = "Sensitivity",
                         color = neu.TextPrimary,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "Forces a crosshair overlay onto the STB screen",
+                        text = "x%.1f".format(airState.sensitivity),
                         color = neu.TextSecondary,
-                        fontSize = 10.sp
+                        fontSize = 11.sp
                     )
                 }
-                Switch(
-                    checked = airState.showPointer,
-                    onCheckedChange = { onTogglePointerOverlay() }
+                Slider(
+                    value = airState.sensitivity,
+                    onValueChange = onSensitivityChange,
+                    valueRange = 0.5f..3f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = neu.OceanicBlue,
+                        activeTrackColor = neu.OceanicBlue.copy(alpha = 0.8f),
+                        inactiveTrackColor = neu.DarkShadow.copy(alpha = 0.18f)
+                    )
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Mouse,
+                        contentDescription = null,
+                        tint = neu.TextSecondary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Show crosshair on TV (ADB mode)",
+                            color = neu.TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "System overlay so injected moves are visible",
+                            color = neu.TextSecondary,
+                            fontSize = 10.sp
+                        )
+                    }
+                    Switch(
+                        checked = airState.showPointer,
+                        onCheckedChange = { onTogglePointerOverlay() }
+                    )
+                }
             }
         }
 
@@ -1176,7 +1438,8 @@ fun AirMouseTab(
             BtHidCard(
                 airState = airState,
                 onConnectPeer = onConnectBtPeer,
-                onDisconnect = onDisconnectBt
+                onDisconnect = onDisconnectBt,
+                onMakeVisible = onMakeBtVisible
             )
         }
 
@@ -1381,7 +1644,8 @@ private fun AirTransportPill(
 private fun BtHidCard(
     airState: AirMouseState,
     onConnectPeer: (BtPeer) -> Unit,
-    onDisconnect: () -> Unit
+    onDisconnect: () -> Unit,
+    onMakeVisible: () -> Unit
 ) {
     val neu = LocalNeuColors.current
     Row(
@@ -1428,6 +1692,31 @@ private fun BtHidCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+            if (!airState.cursorViaBluetooth) {
+                Spacer(modifier = Modifier.height(6.dp))
+                NeuButton(
+                    onClick = onMakeVisible,
+                    cornerRadius = 16.dp,
+                    backgroundColor = neu.OceanicBlue.copy(alpha = 0.45f),
+                    modifier = Modifier.height(38.dp).widthIn(min = 120.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Outlined.WifiTethering,
+                            contentDescription = null,
+                            tint = neu.TextPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "Make phone visible",
+                            color = neu.TextPrimary,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
             }
             if (airState.btPeers.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(6.dp))
@@ -1605,8 +1894,9 @@ fun NeumorphicBottomTabBar(
     val tabs = listOf(
         "Remote" to Icons.Outlined.SettingsRemote,
         "Trackpad" to Icons.Outlined.TouchApp,
-        "Dashboard" to Icons.Outlined.Dashboard,
-        "Air Mouse" to Icons.Outlined.Airplay
+        "Dash" to Icons.Outlined.Dashboard,
+        "Mouse" to Icons.Outlined.Airplay,
+        "Mic" to Icons.Outlined.Mic
     )
 
     Row(
