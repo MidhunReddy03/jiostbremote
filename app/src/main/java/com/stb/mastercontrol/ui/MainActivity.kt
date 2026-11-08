@@ -1,6 +1,8 @@
 package com.stb.mastercontrol.ui
 
+import android.Manifest
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -41,6 +43,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
@@ -57,6 +60,7 @@ import com.stb.mastercontrol.ui.theme.DarkNeuColors
 import com.stb.mastercontrol.ui.theme.LightNeuColors
 import com.stb.mastercontrol.ui.theme.LocalNeuColors
 import com.stb.mastercontrol.ui.theme.dashedBorder
+import com.stb.mastercontrol.data.BtMouseController.BtPeer
 import com.stb.mastercontrol.ui.theme.neumorphic
 import kotlin.math.abs
 
@@ -176,18 +180,44 @@ fun StbMasterControlApp(
                     onRefresh = viewModel::refreshDashboardData,
                     onLaunchApp = viewModel::launchTvApp
                 )
-                3 -> AirMouseTab(
-                    airState = airState,
-                    connected = state.connectionStatus == ConnectionStatus.CONNECTED,
-                    onToggleArm = viewModel::toggleAirMouse,
-                    onSendKey = viewModel::sendKey,
-                    onSensitivityChange = viewModel::setAirMouseSensitivity,
-                    onOpenCalibration = viewModel::openCalibration,
-                    onSaveRestPosition = viewModel::saveRestPosition,
-                    onCancelCalibration = viewModel::cancelCalibration,
-                    onFinishCalibration = viewModel::closeCalibration,
-                    onTogglePointerOverlay = viewModel::togglePointerOverlay
-                )
+                3 -> {
+                    // Android 12+ needs a runtime grant to talk over Bluetooth.
+                    val btLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestPermission()
+                    ) { granted ->
+                        viewModel.onBluetoothPermissionResult()
+                        if (!granted) viewModel.onBluetoothDenied()
+                    }
+                    AirMouseTab(
+                        airState = airState,
+                        connected = state.connectionStatus == ConnectionStatus.CONNECTED,
+                        onToggleArm = viewModel::toggleAirMouse,
+                        onSendKey = viewModel::sendKey,
+                        onSensitivityChange = viewModel::setAirMouseSensitivity,
+                        onOpenCalibration = viewModel::openCalibration,
+                        onSaveRestPosition = viewModel::saveRestPosition,
+                        onCancelCalibration = viewModel::cancelCalibration,
+                        onFinishCalibration = viewModel::closeCalibration,
+                        onTogglePointerOverlay = viewModel::togglePointerOverlay,
+                        onTransportChange = viewModel::setAirMouseTransport,
+                        onRequestBtPermission = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                btLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                            } else {
+                                viewModel.onBluetoothPermissionResult()
+                            }
+                        },
+                        onRefreshBtPeers = viewModel::refreshBtPeers,
+                        onConnectBtPeer = { peer ->
+                            if (viewModel.hasBluetoothPermission()) {
+                                viewModel.connectBtPeer(peer)
+                            } else {
+                                btLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                            }
+                        },
+                        onDisconnectBt = viewModel::disconnectBt
+                    )
+                }
             }
         }
 
@@ -994,7 +1024,12 @@ fun AirMouseTab(
     onSaveRestPosition: () -> Unit,
     onCancelCalibration: () -> Unit,
     onFinishCalibration: () -> Unit,
-    onTogglePointerOverlay: () -> Unit
+    onTogglePointerOverlay: () -> Unit,
+    onTransportChange: (AirMouseTransport) -> Unit,
+    onRequestBtPermission: () -> Unit,
+    onRefreshBtPeers: () -> Unit,
+    onConnectBtPeer: (BtPeer) -> Unit,
+    onDisconnectBt: () -> Unit
 ) {
     val neu = LocalNeuColors.current
     val animatedX by animateDpAsState(
@@ -1061,7 +1096,7 @@ fun AirMouseTab(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "x%-2.2f".format(airState.sensitivity),
+                    text = "x%.1f".format(airState.sensitivity),
                     color = neu.TextSecondary,
                     fontSize = 11.sp
                 )
@@ -1105,6 +1140,44 @@ fun AirMouseTab(
                     onCheckedChange = { onTogglePointerOverlay() }
                 )
             }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // ---- Transport selector: Bluetooth HID cursor vs ADB injection ----
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            AirTransportPill(
+                label = "Bluetooth",
+                subtitle = "Real TV cursor",
+                icon = Icons.Outlined.Bluetooth,
+                selected = airState.transport == AirMouseTransport.BLUETOOTH,
+                onClick = {
+                    onTransportChange(AirMouseTransport.BLUETOOTH)
+                    onRefreshBtPeers()
+                },
+                modifier = Modifier.weight(1f)
+            )
+            AirTransportPill(
+                label = "ADB",
+                subtitle = "Injection",
+                icon = Icons.Outlined.ElectricalServices,
+                selected = airState.transport == AirMouseTransport.ADB,
+                onClick = { onTransportChange(AirMouseTransport.ADB) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // ---- Bluetooth HID device picker ----
+        if (airState.transport == AirMouseTransport.BLUETOOTH) {
+            Spacer(modifier = Modifier.height(8.dp))
+            BtHidCard(
+                airState = airState,
+                onConnectPeer = onConnectBtPeer,
+                onDisconnect = onDisconnectBt
+            )
         }
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -1226,6 +1299,11 @@ fun AirMouseTab(
 
         Text(
             text = when {
+                airState.transport == AirMouseTransport.BLUETOOTH &&
+                    !airState.cursorViaBluetooth ->
+                    "Bluetooth mode: pair the STB with this phone, then tap its name above."
+                airState.transport == AirMouseTransport.BLUETOOTH ->
+                    "Bluetooth HID live — the TV draws a real hardware cursor."
                 airState.calStep == AirCalibrationStep.POINT_AT_TV ->
                     "Calibration: point the phone at the TV centre and tap Save."
                 airState.calStep == AirCalibrationStep.DONE ->
@@ -1252,6 +1330,151 @@ fun AirMouseTab(
         AirMouseCalibrationFinishedOverlay(
             onFinished = onFinishCalibration
         )
+    }
+}
+
+// ============================================================================
+// AIR MOUSE: TRANSPORT PILL + BLUETOOTH HID DEVICE CARD
+// ============================================================================
+@Composable
+private fun AirTransportPill(
+    label: String,
+    subtitle: String,
+    icon: ImageVector,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val neu = LocalNeuColors.current
+    NeuButton(
+        onClick = onClick,
+        cornerRadius = 18.dp,
+        backgroundColor = if (selected) neu.OceanicBlue.copy(alpha = 0.35f) else neu.Background,
+        modifier = modifier.height(52.dp)
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = neu.TextPrimary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(5.dp))
+                Text(
+                    text = label,
+                    color = neu.TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Text(
+                text = subtitle,
+                color = neu.TextSecondary,
+                fontSize = 9.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun BtHidCard(
+    airState: AirMouseState,
+    onConnectPeer: (BtPeer) -> Unit,
+    onDisconnect: () -> Unit
+) {
+    val neu = LocalNeuColors.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .neumorphic(cornerRadius = 20.dp, backgroundColor = neu.GlassSurface)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Mouse,
+            contentDescription = null,
+            tint = if (airState.cursorViaBluetooth) neu.MutedSage else neu.TextSecondary,
+            modifier = Modifier.size(22.dp)
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            if (airState.cursorViaBluetooth) {
+                Text(
+                    text = "Mouse connected — TV shows a real cursor",
+                    color = neu.TextPrimary,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "Keys, dashboard & sideload still go over ADB",
+                    color = neu.TextSecondary,
+                    fontSize = 9.sp
+                )
+            } else {
+                Text(
+                    text = "Pick your TV from the paired devices",
+                    color = neu.TextPrimary,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (airState.btStatus.isNotEmpty()) airState.btStatus
+                    else "Pair the phone on the STB first: Settings → Bluetooth",
+                    color = neu.TextSecondary,
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (airState.btPeers.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(airState.btPeers) { peer ->
+                        NeuButton(
+                            onClick = { onConnectPeer(peer) },
+                            cornerRadius = 14.dp,
+                            backgroundColor = neu.OceanicBlue.copy(alpha = 0.3f)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Outlined.AddLink,
+                                    contentDescription = null,
+                                    tint = neu.TextPrimary,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = peer.name,
+                                    color = neu.TextPrimary,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.widthIn(max = 110.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (airState.cursorViaBluetooth) {
+            NeuButton(
+                onClick = onDisconnect,
+                cornerRadius = 16.dp,
+                backgroundColor = neu.SoftCoral.copy(alpha = 0.35f),
+                modifier = Modifier.height(40.dp)
+            ) {
+                Text(
+                    text = "Off",
+                    color = neu.TextPrimary,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                )
+            }
+        }
     }
 }
 

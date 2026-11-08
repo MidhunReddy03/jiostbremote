@@ -11,6 +11,8 @@ import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.stb.mastercontrol.data.AdbEngine
+import com.stb.mastercontrol.data.BtMouseController
+import com.stb.mastercontrol.data.BtMouseController.BtPeer
 import com.stb.mastercontrol.data.RamStats
 import com.stb.mastercontrol.data.TvApp
 import kotlinx.coroutines.delay
@@ -28,6 +30,14 @@ enum class ConnectionStatus { CONNECTING, CONNECTED, SLEEP_OR_OFFLINE }
 
 enum class AirCalibrationStep { NONE, POINT_AT_TV, DONE }
 
+/** How cursor movements reach the TV. */
+enum class AirMouseTransport {
+    /** Real hardware cursor over Bluetooth HID (TV sees a genuine mouse). */
+    BLUETOOTH,
+    /** Legacy ADB `input` injection (keys, dashboard etc. still use this). */
+    ADB
+}
+
 /** Live state of the gyro-driven air mouse. */
 data class AirMouseState(
     /** `true` while the phone's sensors are streaming cursor deltas to the STB. */
@@ -42,7 +52,15 @@ data class AirMouseState(
     /** Current step of the one-time calibration wizard. */
     val calStep: AirCalibrationStep = AirCalibrationStep.NONE,
     /** True while the on-screen cursor overlay is being drawn on the TV. */
-    val showPointer: Boolean = true
+    val showPointer: Boolean = true,
+    /** Selected transmission path for cursor movement. */
+    val transport: AirMouseTransport = AirMouseTransport.ADB,
+    /** True while the Bluetooth HID mouse is actually paired-through to the TV. */
+    val cursorViaBluetooth: Boolean = false,
+    /** Paired Bluetooth devices the user can pick the TV from. */
+    val btPeers: List<BtPeer> = emptyList(),
+    /** Latest Bluetooth status / error line. */
+    val btStatus: String = ""
 )
 
 data class UiState(
@@ -58,6 +76,7 @@ data class UiState(
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val adb = AdbEngine(application.applicationContext)
+    private val btMouse = BtMouseController(application.applicationContext)
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -119,6 +138,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         startConnectionWatchdog()
         startTrackpadFlusher()
         readAirMousePrefs()
+        viewModelScope.launch {
+            btMouse.state.collect { bt ->
+                _airMouseState.update {
+                    it.copy(
+                        cursorViaBluetooth = bt.connected,
+                        btPeers = bt.paired,
+                        btStatus = bt.status
+                    )
+                }
+            }
+        }
     }
 
     private fun readAirMousePrefs() {
@@ -131,7 +161,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _airMouseState.value = _airMouseState.value.copy(
                 sensitivity = sensitivity.coerceIn(0.5f, 3f),
                 calibrated = prefs.getBoolean(KEY_AIR_CALIBRATED, false),
-                showPointer = prefs.getBoolean(KEY_AIR_SHOW_POINTER, true)
+                showPointer = prefs.getBoolean(KEY_AIR_SHOW_POINTER, true),
+                transport = if (prefs.getBoolean(KEY_AIR_BT_TRANSPORT, false))
+                    AirMouseTransport.BLUETOOTH else AirMouseTransport.ADB
             )
             restYaw = prefs.getFloat(KEY_AIR_REST_YAW, 0f)
             restPitch = prefs.getFloat(KEY_AIR_REST_PITCH, 0f)
@@ -148,6 +180,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .putFloat(KEY_AIR_SENSITIVITY, _airMouseState.value.sensitivity)
                 .putBoolean(KEY_AIR_CALIBRATED, _airMouseState.value.calibrated)
                 .putBoolean(KEY_AIR_SHOW_POINTER, _airMouseState.value.showPointer)
+                .putBoolean(KEY_AIR_BT_TRANSPORT, _airMouseState.value.transport == AirMouseTransport.BLUETOOTH)
                 .putFloat(KEY_AIR_REST_YAW, restYaw)
                 .putFloat(KEY_AIR_REST_PITCH, restPitch)
                 .apply()
@@ -204,22 +237,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     // Drain gyro deltas, drop sub-unit remainders into the next tick
                     val rawX = pendingAirX.getAndSet(0)
                     val rawY = pendingAirY.getAndSet(0)
-                    val combinedX = rawX + leftoverX.getAndSet(0)
-                    val combinedY = rawY + leftoverY.getAndSet(0)
-                    val dx = combinedX / MILLI_SCALE
-                    val dy = combinedY / MILLI_SCALE
-                    leftoverX.set(combinedX - dx * MILLI_SCALE)
-                    leftoverY.set(combinedY - dy * MILLI_SCALE)
-                    if (dx != 0 || dy != 0) {
-                        lastAirMouseActivity = System.currentTimeMillis()
-                        adb.sendMouseRoll(dx, dy)
-                    }
-                    // Keep the cursor rendered on the TV: many builds hide it
-                    // after a few idle seconds unless a mouse event arrives.
-                    val idleFor = System.currentTimeMillis() - lastAirMouseActivity
-                    if (idleFor > CURSOR_KEEPALIVE_MS) {
-                        adb.wakePointer()
-                        lastAirMouseActivity = System.currentTimeMillis()
+                    val usingBt = _airMouseState.value.transport == AirMouseTransport.BLUETOOTH &&
+                        btMouse.hasConnection()
+                    if (usingBt) {
+                        // Bluetooth HID: 1 report count == 1 cursor step on the TV.
+                        val combinedX = rawX + leftoverX.getAndSet(0)
+                        val combinedY = rawY + leftoverY.getAndSet(0)
+                        val dx = combinedX / BT_MILLI_PER_REPORT
+                        val dy = combinedY / BT_MILLI_PER_REPORT
+                        leftoverX.set(combinedX - dx * BT_MILLI_PER_REPORT)
+                        leftoverY.set(combinedY - dy * BT_MILLI_PER_REPORT)
+                        if (dx != 0 || dy != 0) {
+                            lastAirMouseActivity = System.currentTimeMillis()
+                            btMouse.sendMove(dx.coerceIn(-100, 100), dy.coerceIn(-100, 100))
+                        }
+                    } else {
+                        val combinedX = rawX + leftoverX.getAndSet(0)
+                        val combinedY = rawY + leftoverY.getAndSet(0)
+                        val dx = combinedX / MILLI_SCALE
+                        val dy = combinedY / MILLI_SCALE
+                        leftoverX.set(combinedX - dx * MILLI_SCALE)
+                        leftoverY.set(combinedY - dy * MILLI_SCALE)
+                        if (dx != 0 || dy != 0) {
+                            lastAirMouseActivity = System.currentTimeMillis()
+                            adb.sendMouseRoll(dx, dy)
+                        }
+                        // Keep the cursor rendered on the TV: many builds hide it
+                        // after a few idle seconds unless a mouse event arrives.
+                        val idleFor = System.currentTimeMillis() - lastAirMouseActivity
+                        if (idleFor > CURSOR_KEEPALIVE_MS) {
+                            adb.wakePointer()
+                            lastAirMouseActivity = System.currentTimeMillis()
+                        }
                     }
                 }
                 delay(40L) // ~25Hz, smooth enough for a gyro pointer
@@ -262,9 +311,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _airMouseState.update { it.copy(armed = true) }
         lastAirMouseActivity = System.currentTimeMillis()
         firstFrame = true
-        viewModelScope.launch {
-            runCatching { adb.setPointerOverlayEnabled(_airMouseState.value.showPointer) }
-            runCatching { adb.wakePointer() }
+        // The system crosshair only matters for ADB injection; with Bluetooth
+        // HID the TV draws a real hardware cursor all by itself.
+        if (_airMouseState.value.transport == AirMouseTransport.ADB) {
+            viewModelScope.launch {
+                runCatching { adb.setPointerOverlayEnabled(_airMouseState.value.showPointer) }
+                runCatching { adb.wakePointer() }
+            }
+        } else {
+            viewModelScope.launch { runCatching { btMouse.start() } }
         }
     }
 
@@ -280,7 +335,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             sensorListener = null
         }
         // Hide the TV crosshair again so it doesn't become a permanent eyesore.
-        if (_airMouseState.value.showPointer) {
+        if (_airMouseState.value.showPointer &&
+            _airMouseState.value.transport == AirMouseTransport.ADB
+        ) {
             viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(false) } }
         }
     }
@@ -362,7 +419,57 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val next = !_airMouseState.value.showPointer
         _airMouseState.update { it.copy(showPointer = next) }
         writeAirMousePrefs()
-        viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(next) } }
+        if (_airMouseState.value.transport == AirMouseTransport.ADB) {
+            viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(next) } }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Bluetooth HID mouse
+    // ---------------------------------------------------------------------
+
+    /** Chooses how cursor movements reach the TV (persisted). */
+    fun setAirMouseTransport(transport: AirMouseTransport) {
+        _airMouseState.update { it.copy(transport = transport) }
+        writeAirMousePrefs()
+        if (transport == AirMouseTransport.BLUETOOTH) {
+            btMouse.start()
+        } else {
+            // Crosshair overlay only matters for ADB injection.
+            if (_airMouseState.value.armed && _airMouseState.value.showPointer) {
+                viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(true) } }
+            }
+        }
+    }
+
+    /** Power-up / refresh of the Bluetooth HID layer. Returns true when ready. */
+    fun startBluetoothMouse(): Boolean = btMouse.start()
+
+    /** True when the app already holds the Bluetooth runtime permission. */
+    fun hasBluetoothPermission(): Boolean = btMouse.hasPermission()
+
+    fun refreshBtPeers() = btMouse.refreshPeers()
+
+    fun connectBtPeer(peer: BtPeer) {
+        val ok = btMouse.connectTo(peer)
+        if (!ok) {
+            _airMouseState.update { it.copy(btStatus = "Could not reach ${peer.name}") }
+        }
+    }
+
+    fun disconnectBt() = btMouse.disconnect()
+
+    /** Called after the runtime BLUETOOTH_CONNECT grant comes back. */
+    fun onBluetoothPermissionResult() {
+        viewModelScope.launch { btMouse.start() }
+        refreshBtPeers()
+    }
+
+    /** Shown when BLUETOOTH_CONNECT is denied — BT mouse stays unavailable. */
+    fun onBluetoothDenied() {
+        _airMouseState.update {
+            it.copy(btStatus = "Bluetooth permission denied — ADB cursor mode kept")
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -502,6 +609,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         disarmAirMouse()
+        runCatching { btMouse.stop() }
         adb.close()
     }
 
@@ -511,12 +619,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_AIR_SENSITIVITY = "air_sensitivity"
         private const val KEY_AIR_CALIBRATED = "air_calibrated"
         private const val KEY_AIR_SHOW_POINTER = "air_show_pointer"
+        private const val KEY_AIR_BT_TRANSPORT = "air_bt_transport"
         private const val KEY_AIR_REST_YAW = "air_rest_yaw"
         private const val KEY_AIR_REST_PITCH = "air_rest_pitch"
 
         /** TV-cursor pixels per radian of phone yaw/pitch: 90° = ~700 px, comfortable. */
         private const val STEPS_PER_RADIAN = 440f
         private const val MILLI_SCALE = 1000
+        /** Milli-units per Bluetooth HID report count (1 count ≈ 1 cursor step). */
+        private const val BT_MILLI_PER_REPORT = 120
         private const val CURSOR_KEEPALIVE_MS = 3000L
 
         private fun readDarkModePref(app: Application): Boolean = runCatching {
