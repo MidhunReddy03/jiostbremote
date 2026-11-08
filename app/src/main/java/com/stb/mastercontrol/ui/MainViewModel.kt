@@ -26,6 +26,8 @@ import kotlin.math.roundToInt
 
 enum class ConnectionStatus { CONNECTING, CONNECTED, SLEEP_OR_OFFLINE }
 
+enum class AirCalibrationStep { NONE, POINT_AT_TV, DONE }
+
 /** Live state of the gyro-driven air mouse. */
 data class AirMouseState(
     /** `true` while the phone's sensors are streaming cursor deltas to the STB. */
@@ -34,7 +36,13 @@ data class AirMouseState(
     val pointerX: Float = 0f,
     val pointerY: Float = 0f,
     /** Multiplier applied to gyro deltas, 0.5 .. 3.0. */
-    val sensitivity: Float = 1f
+    val sensitivity: Float = 1f,
+    /** Whether a one-time rest-position calibration has been stored. */
+    val calibrated: Boolean = false,
+    /** Current step of the one-time calibration wizard. */
+    val calStep: AirCalibrationStep = AirCalibrationStep.NONE,
+    /** True while the on-screen cursor overlay is being drawn on the TV. */
+    val showPointer: Boolean = true
 )
 
 data class UiState(
@@ -85,9 +93,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val leftoverX = AtomicInteger(0)
     private val leftoverY = AtomicInteger(0)
     private val sensorLock = Any()
-    private var lastSensorNanos = 0L
     private var sensorListener: SensorEventListener? = null
     @Volatile private var lastAirMouseActivity = 0L
+
+    /** Latest absolute orientation, in radians, from the rotation-vector sensor. */
+    @Volatile private var currentYaw = 0f
+    @Volatile private var currentPitch = 0f
+
+    /** Calibration baseline captured by the one-time wizard. */
+    @Volatile private var restYaw = 0f
+    @Volatile private var restPitch = 0f
+    /** Last target position already flushed as a delta. */
+    @Volatile private var lastCursorPxX = 0f
+    @Volatile private var lastCursorPxY = 0f
+    /** True only on the very first rotation-vector frame after arming. */
+    @Volatile private var firstFrame = true
 
     // Trackpad delta accumulators flushed at 20Hz (every 50ms) to avoid flooding the 32-bit STB
     private val pendingDx = AtomicInteger(0)
@@ -98,6 +118,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         startConnectionWatchdog()
         startTrackpadFlusher()
+        readAirMousePrefs()
+    }
+
+    private fun readAirMousePrefs() {
+        val app = getApplication<Application>()
+        val prefs = runCatching {
+            app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        }.getOrNull() ?: return
+        runCatching {
+            val sensitivity = prefs.getFloat(KEY_AIR_SENSITIVITY, 1f)
+            _airMouseState.value = _airMouseState.value.copy(
+                sensitivity = sensitivity.coerceIn(0.5f, 3f),
+                calibrated = prefs.getBoolean(KEY_AIR_CALIBRATED, false),
+                showPointer = prefs.getBoolean(KEY_AIR_SHOW_POINTER, true)
+            )
+            restYaw = prefs.getFloat(KEY_AIR_REST_YAW, 0f)
+            restPitch = prefs.getFloat(KEY_AIR_REST_PITCH, 0f)
+            lastCursorPxX = 0f
+            lastCursorPxY = 0f
+        }
+    }
+
+    private fun writeAirMousePrefs() {
+        runCatching {
+            getApplication<Application>()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putFloat(KEY_AIR_SENSITIVITY, _airMouseState.value.sensitivity)
+                .putBoolean(KEY_AIR_CALIBRATED, _airMouseState.value.calibrated)
+                .putBoolean(KEY_AIR_SHOW_POINTER, _airMouseState.value.showPointer)
+                .putFloat(KEY_AIR_REST_YAW, restYaw)
+                .putFloat(KEY_AIR_REST_PITCH, restPitch)
+                .apply()
+        }
     }
 
     private fun startConnectionWatchdog() {
@@ -184,8 +238,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (_airMouseState.value.armed) return
         val sm = getApplication<Application>()
             .getSystemService(Context.SENSOR_SERVICE) as? SensorManager
-        val gyro = sm?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        if (sm == null || gyro == null) {
+        val rotation = sm?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        if (sm == null || rotation == null) {
             _uiState.update {
                 it.copy(statusMessage = "Air mouse unavailable on this phone")
             }
@@ -195,11 +249,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val listener = object : SensorEventListener {
                 override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
                 override fun onSensorChanged(event: SensorEvent) {
-                    handleGyroEvent(event)
+                    handleRotationEvent(event)
                 }
             }
             sensorListener = listener
-            sm.registerListener(listener, gyro, SensorManager.SENSOR_DELAY_GAME)
+            sm.registerListener(listener, rotation, SensorManager.SENSOR_DELAY_GAME)
         }
         if (!flusherStarted) {
             flusherStarted = true
@@ -207,8 +261,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _airMouseState.update { it.copy(armed = true) }
         lastAirMouseActivity = System.currentTimeMillis()
-        // First micro-move wakes the on-screen pointer arrow so the user can see it.
+        firstFrame = true
         viewModelScope.launch {
+            runCatching { adb.setPointerOverlayEnabled(_airMouseState.value.showPointer) }
             runCatching { adb.wakePointer() }
         }
     }
@@ -224,58 +279,135 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             sensorListener = null
         }
+        // Hide the TV crosshair again so it doesn't become a permanent eyesore.
+        if (_airMouseState.value.showPointer) {
+            viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(false) } }
+        }
     }
 
     /**
-     * Integrates the rotation rate into a relative cursor delta.
+     * Absolute air mouse: the phone acts like a pointing stick.
      *
-     * Portrait / axis map (phone held in front of the TV):
-     *   yaw  (X of the cursor)   -> device GYROSCOPE Y axis
-     *   pitch(Y of the cursor)   -> device GYROSCOPE X axis (inverted)
-     *
-     * Landscape is remapped based on the display rotation.
+     * Each frame we read yaw/pitch from the rotation-vector sensor and convert
+     * the **offset from the calibrated rest pose** into a target screen position.
+     * We then send only the *delta* since the previous frame over ADB, so the
+     * TV cursor follows the phone smoothly at 25Hz.
      */
-    private fun handleGyroEvent(event: SensorEvent) {
+    private fun handleRotationEvent(event: SensorEvent) {
+        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        val rotMatrix = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(rotMatrix, event.values)
+        val orientation = FloatArray(3)
+        remapToDisplay(rotMatrix, orientation)
+        currentYaw = orientation[0]
+        currentPitch = orientation[1]
         if (!_airMouseState.value.armed) return
-        val dtSeconds: Float
-        synchronized(sensorLock) {
-            if (lastSensorNanos == 0L) {
-                lastSensorNanos = event.timestamp
-                return
-            }
-            dtSeconds = (event.timestamp - lastSensorNanos) * NANOS_TO_SECONDS
-            lastSensorNanos = event.timestamp
-        }
-        if (dtSeconds <= 0f || dtSeconds > 0.5f) return // drop large gaps (device wake / lag)
 
-        val rotation = event.values
-        if (rotation.size < 3) return
-        val rX = rotation[0]
-        val rY = rotation[1]
-        val display = (getApplication<Application>()
-            .getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager)?.defaultDisplay
-        val (yaw, pitch) = when (display?.rotation ?: Surface.ROTATION_0) {
-            Surface.ROTATION_90 -> Pair(-rX, -rY)
-            Surface.ROTATION_180 -> Pair(rX, rY)
-            Surface.ROTATION_270 -> Pair(rX, rY)
-            else -> Pair(rY, -rX)
-        }
+        val dYaw = wrapped(currentYaw - restYaw)
+        val dPitch = wrapped(currentPitch - restPitch)
         val sensitivity = _airMouseState.value.sensitivity
-        val milli = STEPS_PER_RADIAN * MILLI_SCALE * sensitivity
-        pendingAirX.addAndGet((yaw * dtSeconds * milli).roundToInt())
-        pendingAirY.addAndGet((pitch * dtSeconds * milli).roundToInt())
+        val targetX = dYaw * STEPS_PER_RADIAN * sensitivity
+        val targetY = dPitch * STEPS_PER_RADIAN * sensitivity
 
-        // Mirror the movement on the on-phone visual pointer (wraps like a ball).
+        if (firstFrame) {
+            // Skip the very first frame so the cursor doesn't teleport.
+            firstFrame = false
+            lastCursorPxX = targetX
+            lastCursorPxY = targetY
+            return
+        }
+
+        pendingAirX.addAndGet(((targetX - lastCursorPxX) * MILLI_SCALE).roundToInt())
+        pendingAirY.addAndGet(((targetY - lastCursorPxY) * MILLI_SCALE).roundToInt())
+        lastCursorPxX = targetX
+        lastCursorPxY = targetY
+
+        // Mirror the pointing pose on the on-phone visual (wraps like a ball).
+        val vertical = (Math.PI.toFloat() / 2f)
         _airMouseState.update { state ->
             state.copy(
-                pointerX = wrapped(state.pointerX + yaw * dtSeconds * sensitivity * TRAIL_SCALE),
-                pointerY = wrapped(state.pointerY + pitch * dtSeconds * sensitivity * TRAIL_SCALE)
+                pointerX = (dYaw / vertical).coerceIn(-1f, 1f),
+                pointerY = (dPitch / vertical).coerceIn(-1f, 1f)
             )
         }
     }
 
+    /** Applies the screen-rotation dependent axis remap, then reads yaw/pitch. */
+    private fun remapToDisplay(rotMatrix: FloatArray, orientation: FloatArray) {
+        val rotation = (getApplication<Application>()
+            .getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager)
+            ?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        when (rotation) {
+            Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(
+                rotMatrix, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, rotMatrix
+            )
+            Surface.ROTATION_180 -> SensorManager.remapCoordinateSystem(
+                rotMatrix, SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y, rotMatrix
+            )
+            Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
+                rotMatrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, rotMatrix
+            )
+            else -> Unit
+        }
+        SensorManager.getOrientation(rotMatrix, orientation)
+    }
+
     fun setAirMouseSensitivity(value: Float) {
-        _airMouseState.update { it.copy(sensitivity = value.coerceIn(0.5f, 3f)) }
+        val next = value.coerceIn(0.5f, 3f)
+        _airMouseState.update { it.copy(sensitivity = next) }
+        writeAirMousePrefs()
+    }
+
+    fun togglePointerOverlay() {
+        val next = !_airMouseState.value.showPointer
+        _airMouseState.update { it.copy(showPointer = next) }
+        writeAirMousePrefs()
+        viewModelScope.launch { runCatching { adb.setPointerOverlayEnabled(next) } }
+    }
+
+    // ---------------------------------------------------------------------
+    // One-time calibration wizard
+    // ---------------------------------------------------------------------
+
+    /** Opens the one-time "point at the TV centre" setup screen. */
+    fun openCalibration() {
+        _airMouseState.update {
+            it.copy(calStep = AirCalibrationStep.POINT_AT_TV)
+        }
+    }
+
+    /** Cancels the wizard without changing the stored baseline. */
+    fun cancelCalibration() {
+        _airMouseState.update { it.copy(calStep = AirCalibrationStep.NONE) }
+    }
+
+    /**
+     * Snapshots the phone's current pointing pose as the cursor's origin.
+     * This is the heart of the one-time calibration: the TV cursor is
+     * therefore centred on the STB whenever the user is pointing at it.
+     */
+    fun saveRestPosition() {
+        val yaw = currentYaw
+        val pitch = currentPitch
+        runCatching {
+            restYaw = yaw
+            restPitch = pitch
+            lastCursorPxX = 0f
+            lastCursorPxY = 0f
+            firstFrame = true
+        }
+        _airMouseState.update { it.copy(calibrated = true, calStep = AirCalibrationStep.DONE) }
+        writeAirMousePrefs()
+        lastAirMouseActivity = System.currentTimeMillis()
+    }
+
+    fun closeCalibration() {
+        _airMouseState.update { it.copy(calStep = AirCalibrationStep.NONE) }
+    }
+
+    fun resetCalibration() {
+        _airMouseState.update { it.copy(calibrated = false, calStep = AirCalibrationStep.NONE) }
+        writeAirMousePrefs()
     }
 
     fun manualReconnect() {
@@ -376,13 +508,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val PREFS_NAME = "stb_prefs"
         private const val KEY_DARK_MODE = "dark_mode"
+        private const val KEY_AIR_SENSITIVITY = "air_sensitivity"
+        private const val KEY_AIR_CALIBRATED = "air_calibrated"
+        private const val KEY_AIR_SHOW_POINTER = "air_show_pointer"
+        private const val KEY_AIR_REST_YAW = "air_rest_yaw"
+        private const val KEY_AIR_REST_PITCH = "air_rest_pitch"
 
-        /** ~100 TV-cursor pixels per radian of phone yaw/pitch. */
-        private const val STEPS_PER_RADIAN = 100f
+        /** TV-cursor pixels per radian of phone yaw/pitch: 90° = ~700 px, comfortable. */
+        private const val STEPS_PER_RADIAN = 440f
         private const val MILLI_SCALE = 1000
-        /** How far the on-phone visual pointer travels per rad/s of sustained tilt. */
-        private const val TRAIL_SCALE = 1.4f
-        private const val NANOS_TO_SECONDS = 1f / 1_000_000_000f
         private const val CURSOR_KEEPALIVE_MS = 3000L
 
         private fun readDarkModePref(app: Application): Boolean = runCatching {
@@ -390,10 +524,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .getBoolean(KEY_DARK_MODE, false)
         }.getOrDefault(false)
 
-        /** Wraps a normalised -1..1 pointer value so the on-phone ball never sticks. */
+        /** Wraps any angle (or normalised pointer) into -pi..pi / -1..1. */
         private fun wrapped(value: Float): Float = when {
-            value > 1f -> value - 2f
-            value < -1f -> value + 2f
+            value > Math.PI.toFloat() -> value - 2f * Math.PI.toFloat()
+            value < -Math.PI.toFloat() -> value + 2f * Math.PI.toFloat()
             else -> value
         }
     }

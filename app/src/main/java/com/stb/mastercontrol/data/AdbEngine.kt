@@ -151,7 +151,34 @@ class AdbEngine(private val context: Context) {
     suspend fun wakePointer() {
         sendMouseRoll(1, 0)
         sendMouseRoll(-1, 0)
+        sendMouseRoll(0, 1)
+        sendMouseRoll(0, -1)
     }
+
+    /**
+     * Forces Android's on-screen pointer overlay to appear. This is the
+     * hardware-independent fix: the "Pointer location" crosshair is drawn by
+     * the system itself, independently of whether the firmware chooses to
+     * render an arrow for injected mouse events. It shows the exact pixel the
+     * mouse is sitting on, so the user always sees where they are pointing.
+     */
+    suspend fun setPointerOverlayEnabled(enabled: Boolean): Boolean =
+        withContext(Dispatchers.IO) {
+            withDadb {
+                it.shell("settings put secure pointer_location ${if (enabled) 1 else 0}").exitCode == 0
+            } ?: false
+        }
+
+    /**
+     * Shows a full-screen glowing dot for every tap, so air-mouse clicks are
+     * visible on the STB too.
+     */
+    suspend fun setShowTouchesEnabled(enabled: Boolean): Boolean =
+        withContext(Dispatchers.IO) {
+            withDadb {
+                it.shell("settings put secure show_touches ${if (enabled) 1 else 0}").exitCode == 0
+            } ?: false
+        }
 
     suspend fun fetchRamStats(): RamStats? = withContext(Dispatchers.IO) {
         withDadb {

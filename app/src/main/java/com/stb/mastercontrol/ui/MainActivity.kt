@@ -32,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -180,7 +181,12 @@ fun StbMasterControlApp(
                     connected = state.connectionStatus == ConnectionStatus.CONNECTED,
                     onToggleArm = viewModel::toggleAirMouse,
                     onSendKey = viewModel::sendKey,
-                    onSensitivityChange = viewModel::setAirMouseSensitivity
+                    onSensitivityChange = viewModel::setAirMouseSensitivity,
+                    onOpenCalibration = viewModel::openCalibration,
+                    onSaveRestPosition = viewModel::saveRestPosition,
+                    onCancelCalibration = viewModel::cancelCalibration,
+                    onFinishCalibration = viewModel::closeCalibration,
+                    onTogglePointerOverlay = viewModel::togglePointerOverlay
                 )
             }
         }
@@ -983,18 +989,31 @@ fun AirMouseTab(
     connected: Boolean,
     onToggleArm: () -> Unit,
     onSendKey: (Int) -> Unit,
-    onSensitivityChange: (Float) -> Unit
+    onSensitivityChange: (Float) -> Unit,
+    onOpenCalibration: () -> Unit,
+    onSaveRestPosition: () -> Unit,
+    onCancelCalibration: () -> Unit,
+    onFinishCalibration: () -> Unit,
+    onTogglePointerOverlay: () -> Unit
 ) {
     val neu = LocalNeuColors.current
-    val view = LocalView.current
-    val live: Boolean = airState.armed && connected
+    val animatedX by animateDpAsState(
+        targetValue = (airState.pointerX * 74f).dp,
+        animationSpec = tween(durationMillis = 40),
+        label = "air_pointer_x"
+    )
+    val animatedY by animateDpAsState(
+        targetValue = (airState.pointerY * 74f).dp,
+        animationSpec = tween(durationMillis = 40),
+        label = "air_pointer_y"
+    )
 
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // Gyro ball visualiser
+        // Gyro ball / pointing-pad visualiser
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1007,48 +1026,45 @@ fun AirMouseTab(
                 ),
             contentAlignment = Alignment.Center
         ) {
-            // Crosshair
             Box(
                 modifier = Modifier
                     .size(180.dp)
                     .clip(CircleShape)
                     .border(2.dp, neu.DarkShadow.copy(alpha = 0.35f), CircleShape)
             )
-            // The moving pointer that mirrors the TV cursor
-            val offsetX by animateDpAsState(
-                targetValue = (airState.pointerX * 74f).dp,
-                animationSpec = tween(durationMillis = 40),
-                label = "air_pointer_x"
-            )
-            val offsetY by animateDpAsState(
-                targetValue = (airState.pointerY * 74f).dp,
-                animationSpec = tween(durationMillis = 40),
-                label = "air_pointer_y"
-            )
             Box(
                 modifier = Modifier
                     .size(22.dp)
-                    .offset(x = offsetX, y = offsetY)
+                    .offset(x = animatedX, y = animatedY)
                     .clip(CircleShape)
-                    .background(if (live) neu.SoftCoral else neu.TextSecondary.copy(alpha = 0.6f))
+                    .background(if (airState.armed) neu.SoftCoral else neu.TextSecondary.copy(alpha = 0.6f))
             )
             Text(
-                text = if (airState.armed) "[" + "Gyro live" + "]" else "Tilt to move",
+                text = if (airState.calibrated) "Pointing set — calibrated" else "Calibration pending",
                 color = neu.TextSecondary,
                 fontSize = 11.sp
             )
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        // Sensitivity slider
+        // Sensitivity + visibility controls
         Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "Sensitivity", color = neu.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(text = "x%.1f".format(airState.sensitivity), color = neu.TextSecondary, fontSize = 11.sp)
+                Text(
+                    text = "Sensitivity",
+                    color = neu.TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "x%-2.2f".format(airState.sensitivity),
+                    color = neu.TextSecondary,
+                    fontSize = 11.sp
+                )
             }
             Slider(
                 value = airState.sensitivity,
@@ -1057,46 +1073,133 @@ fun AirMouseTab(
                 colors = SliderDefaults.colors(
                     thumbColor = neu.OceanicBlue,
                     activeTrackColor = neu.OceanicBlue.copy(alpha = 0.8f),
-                    inactiveTrackColor = neu.DarkShadow.copy(alpha = 0.15f)
+                    inactiveTrackColor = neu.DarkShadow.copy(alpha = 0.18f)
                 )
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Mouse,
+                    contentDescription = null,
+                    tint = neu.TextSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Show cursor on TV",
+                        color = neu.TextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Forces a crosshair overlay onto the STB screen",
+                        color = neu.TextSecondary,
+                        fontSize = 10.sp
+                    )
+                }
+                Switch(
+                    checked = airState.showPointer,
+                    onCheckedChange = { onTogglePointerOverlay() }
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // One-time calibration row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            NeuButton(
+                onClick = onOpenCalibration,
+                cornerRadius = 24.dp,
+                backgroundColor = if (airState.calibrated) neu.Background
+                                  else neu.OceanicBlue.copy(alpha = 0.35f),
+                modifier = Modifier.weight(1f).height(44.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = if (airState.calibrated) Icons.Outlined.Cached
+                                      else Icons.Outlined.Build,
+                        contentDescription = null,
+                        tint = neu.TextPrimary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (airState.calibrated) "Recalibrate" else "Calibrate",
+                        color = neu.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(1.dp))
+            if (airState.calStep == AirCalibrationStep.POINT_AT_TV) {
+                NeuButton(
+                    onClick = onSaveRestPosition,
+                    cornerRadius = 24.dp,
+                    backgroundColor = neu.MutedSage.copy(alpha = 0.4f),
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Text(
+                        text = "Save",
+                        color = neu.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                NeuButton(
+                    onClick = onCancelCalibration,
+                    cornerRadius = 24.dp,
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Text(
+                        text = "Cancel",
+                        color = neu.TextSecondary,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Back
             NeuButton(
                 onClick = { onSendKey(4) },
                 cornerRadius = 24.dp,
-                modifier = Modifier.weight(1f).height(48.dp)
-            ) { Text(text = "Back", color = neu.TextPrimary, fontSize = 13.sp) }
-            // OK / Center Select
+                modifier = Modifier.weight(1f).height(44.dp)
+            ) { Text(text = "Back", color = neu.TextPrimary, fontSize = 12.sp) }
             NeuButton(
                 onClick = { onSendKey(66) },
                 cornerRadius = 24.dp,
-                modifier = Modifier.weight(1f).height(48.dp)
-            ) { Text(text = "OK", color = neu.TextPrimary, fontSize = 13.sp) }
-            // Home
+                modifier = Modifier.weight(1f).height(44.dp)
+            ) { Text(text = "OK", color = neu.TextPrimary, fontSize = 12.sp) }
             NeuButton(
                 onClick = { onSendKey(3) },
                 cornerRadius = 24.dp,
-                modifier = Modifier.weight(1f).height(48.dp)
-            ) { Text(text = "Home", color = neu.TextPrimary, fontSize = 13.sp) }
+                modifier = Modifier.weight(1f).height(44.dp)
+            ) { Text(text = "Home", color = neu.TextPrimary, fontSize = 12.sp) }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
         NeuButton(
             onClick = onToggleArm,
-            cornerRadius = 30.dp,
+            cornerRadius = 28.dp,
             backgroundColor = if (airState.armed) neu.SoftCoral.copy(alpha = 0.45f)
                               else neu.OceanicBlue.copy(alpha = 0.4f),
-            modifier = Modifier.height(56.dp).fillMaxWidth()
+            modifier = Modifier.height(52.dp).fillMaxWidth()
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1119,15 +1222,151 @@ fun AirMouseTab(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         Text(
-            text = if (live) "Move the phone like a pointing stick — the TV mouse cursor follows you."
-                   else if (airState.armed) "Reconnecting..." else "The TV cursor appears as soon as you start.",
+            text = when {
+                airState.calStep == AirCalibrationStep.POINT_AT_TV ->
+                    "Calibration: point the phone at the TV centre and tap Save."
+                airState.calStep == AirCalibrationStep.DONE ->
+                    "Calibration saved — the TV cursor is now centred when you point at the TV."
+                !airState.calibrated ->
+                    "Run the one-time calibration for centred pointing."
+                airState.armed && connected -> "Move the phone like a pointing stick — the TV crosshair follows."
+                airState.armed -> "Reconnecting to STB..."
+                else -> "Start the air mouse — the TV shows a crosshair where you point."
+            },
             color = neu.TextSecondary,
             fontSize = 11.sp,
             textAlign = TextAlign.Center
         )
+    }
+
+    // Full-screen one-time calibration wizard overlay
+    if (airState.calStep == AirCalibrationStep.POINT_AT_TV) {
+        AirMouseCalibrationOverlay(
+            onSaved = onSaveRestPosition,
+            onDismiss = onCancelCalibration
+        )
+    } else if (airState.calStep == AirCalibrationStep.DONE) {
+        AirMouseCalibrationFinishedOverlay(
+            onFinished = onFinishCalibration
+        )
+    }
+}
+
+@Composable
+fun AirMouseCalibrationOverlay(onSaved: () -> Unit, onDismiss: () -> Unit) {
+    val neu = LocalNeuColors.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.55f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .neumorphic(cornerRadius = 28.dp, backgroundColor = neu.Background)
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "One-time calibration",
+                color = neu.TextPrimary,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "1. Sit where you normally sit.\n"
+                    + "2. Point the phone straight at the centre of the TV.\n"
+                    + "3. Tap Save.\n\n"
+                    + "The TV cursor will now be centred whenever you point at the STB.",
+                color = neu.TextSecondary,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                NeuButton(
+                    onClick = onDismiss,
+                    cornerRadius = 18.dp,
+                    modifier = Modifier.height(42.dp)
+                ) {
+                    Text(
+                        text = "Cancel",
+                        color = neu.TextSecondary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                }
+                NeuButton(
+                    onClick = onSaved,
+                    cornerRadius = 18.dp,
+                    backgroundColor = neu.OceanicBlue.copy(alpha = 0.5f),
+                    modifier = Modifier.height(42.dp)
+                ) {
+                    Text(
+                        text = "Save position",
+                        color = neu.TextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AirMouseCalibrationFinishedOverlay(onFinished: () -> Unit) {
+    val neu = LocalNeuColors.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.55f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .neumorphic(cornerRadius = 28.dp, backgroundColor = neu.Background)
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "Calibration saved ✓",
+                color = neu.TextPrimary,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "Point at the TV again to re-centre. The setting is remembered\nbetween app launches.",
+                color = neu.TextSecondary,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+            NeuButton(
+                onClick = onFinished,
+                cornerRadius = 18.dp,
+                backgroundColor = neu.MutedSage.copy(alpha = 0.5f),
+                modifier = Modifier.height(42.dp)
+            ) {
+                Text(
+                    text = "Done",
+                    color = neu.TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
+        }
     }
 }
 
