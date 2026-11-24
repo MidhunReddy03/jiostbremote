@@ -240,3 +240,71 @@ Optional: Jio ONT USB port exposes the drive over Samba/DLNA so the laptop can b
 
 Rules for anything we add: v7a-only, no GMS, foreground service for background
 work, nothing that touches the keep-list without an explicit confirmation.
+
+---
+
+## 9. Windows-side tooling that already exists
+
+Three desktop scripts were built so the box never needs a typed command:
+
+**`Launch_TV.bat`** — connect + scrcpy, audio left on the TV:
+```bat
+@echo off
+title Jio STB scrcpy Launcher
+adb connect 192.168.29.111:5555
+if exist "C:\scrcpy\scrcpy.exe" ( cd /d "C:\scrcpy" ) else ( cd /d "%~dp0" )
+scrcpy -s 192.168.29.111:5555 --no-audio
+if %ERRORLEVEL% neq 0 ( echo Connection failed. & pause )
+```
+`%~dp0` fallback matters — hardcoding `C:\scrcpy` was the original "path not found".
+
+**`Install_APK_TV.bat`** — drag any `.apk` onto it:
+```bat
+@echo off
+if "%~1"=="" ( echo Drag an APK onto this file. & pause & exit /b )
+adb connect 192.168.29.111:5555
+adb -s 192.168.29.111:5555 install -r "%~1"
+pause
+```
+
+**`TV_Reboot_Tool.bat`** — one-click reboot / reconnect / server restart.
+
+Android TV draws no on-screen nav bar, so in scrcpy: right-click = Back,
+middle-click = Home, `MOD+b` / `MOD+h`, plus `MOD+p` power, `MOD+o` screen off.
+
+**Termux on the phone** (ADB without a laptop): `pkg install android-tools`, then
+`adb connect 192.168.29.111:5555`. Trap: `adb` fails with
+`cannot locate symbol _ZNSt6__ndk113__hash_memoryEPKvm` until you run
+`pkg upgrade` — the binary was linked against a newer libc++ than Termux had.
+
+---
+
+## 10. Key Mapper, extras, and what's still unverified
+
+**Key Mapper** (`io.github.sds100.keymapper`) remaps the coloured remote keys.
+It needs Accessibility **and** installs an invisible IME to intercept presses —
+that invisible IME is why no on-screen keyboard appears in JioHotstar. It cannot
+coexist with a visible keyboard; you pick one. Re-enabling the mic key's Jio hook
+means dropping Key Mapper.
+
+**Tweaks suggested but optional:** HDMI audio → *Passthrough* (skips the software
+mixer); check display mode with `dumpsys display | findstr /i "mModeId"` if
+high-bitrate playback micro-stutters; Aerial Views as screensaver; RetroArch
+(v7a build) for emulation; Moonlight + Sunshine for game streaming; Tailscale for
+remote access (CGNAT makes port-forwarding useless); Stremio for library tracking.
+
+**Deliberately not done:** no rooting, no custom ROM, no router-level blocking of
+Jio DNS/ACS (would break fiber auth and VoIP), no removal of the hidden
+`ADMIN$`/`IPC$`/`C$` shares.
+
+**Still unverified on the live box** (check before assuming):
+1. Which launcher is actually home right now — the doc ends with tvOS-Launcher
+   installed *and* Monet uninstalled, but earlier sections assume Monet.
+2. Whether wireless ADB still returns after a reboot, since the TR-069 clients
+   were disabled in the final RAM pass.
+3. Whether an app can capture the **BLE remote's** mic at all. The doc claims
+   `AudioRecord` will pick it up; our testing showed the remote mic is routed to
+   the system voice app and `tinycap` is kernel-blocked. Phone-mic streaming is
+   the path that definitely works.
+4. `targetSdk 28` is what the doc recommends; STB Control builds at 34 and runs
+   fine — don't "fix" that without a reason.
